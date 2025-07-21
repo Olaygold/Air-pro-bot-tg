@@ -19,7 +19,6 @@ if not firebase_admin._apps:
         "databaseURL": os.getenv("FIREBASE_URL")
     })
 
-
 # Flask setup
 app = Flask(__name__)
 app.secret_key = "supersecret"
