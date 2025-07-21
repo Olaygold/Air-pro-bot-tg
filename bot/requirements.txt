@@ -1,6 +1,0 @@
-python-telegram-bot==20.3
-firebase-admin
-flask
-python-dotenv
-requests
-pytz
