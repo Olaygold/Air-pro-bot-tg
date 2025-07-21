@@ -1,177 +1,190 @@
 import os
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
-from firebase_admin import credentials, db, initialize_app
-from dotenv import load_dotenv
-import datetime
-import pytz
-import firebase_admin
 import json
+import firebase_admin
+from firebase_admin import credentials, db
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from dotenv import load_dotenv
+from datetime import datetime
+import logging
 
+# Load environment variables
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-FIREBASE_URL = os.getenv("FIREBASE_URL")
-GROUP_USERNAME = "@vvcmmbn"
-WHATSAPP_LINK = "https://chat.whatsapp.com/LuidM3j71mDHzeKRZNIJpG"
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+FIREBASE_CREDENTIALS = json.loads(os.environ["FIREBASE_CREDENTIALS"])
+FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL")
+GROUP_USERNAME = os.environ.get("GROUP_USERNAME")  # e.g., "@YourGroup"
 
+# Firebase initialization
+cred = credentials.Certificate(FIREBASE_CREDENTIALS)
+firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
 
-
-# Load Firebase credentials from environment variable
-firebase_config = json.loads(os.environ.get("FIREBASE_CREDENTIALS"))
-
-cred = credentials.Certificate(firebase_config)
-
-if not firebase_admin._apps:
-    firebase_admin.initialize_app(cred, {
-        "databaseURL": os.getenv("FIREBASE_URL")
-    })
-
-# DB References
+# Setup database references
 users_ref = db.reference("users")
-referrals_ref = db.reference("referrals")
 withdrawals_ref = db.reference("withdrawals")
 
+# Logging
+logging.basicConfig(level=logging.INFO)
+
+# --- HANDLERS ---
+
+# /start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    args = context.args
     user_id = str(user.id)
 
-    user_ref = users_ref.child(user_id)
-    if user_ref.get() is None:
-        user_data = {
-            "username": user.username,
-            "balance": 50,
-            "joined": str(datetime.datetime.now()),
-            "referred_by": args[0] if args else "",
-            "referrals": [],
-            "withdrawals": []
-        }
-        user_ref.set(user_data)
-
-        if args:
-            ref_user_id = args[0]
-            ref_user = users_ref.child(ref_user_id).get()
-            if ref_user:
-                ref_user["balance"] += 50
-                ref_user["referrals"].append(user.username)
-                users_ref.child(ref_user_id).set(ref_user)
-                referrals_ref.push({
-                    "referrer": ref_user_id,
-                    "referred": user.username,
-                    "timestamp": str(datetime.datetime.now())
-                })
-
-        await update.message.reply_text(
-            f"✅ Welcome, {user.first_name}!
-You've received ₦50 for joining.
-
-"
-            f"Now, join our WhatsApp group: {WHATSAPP_LINK}"
-        )
-    else:
-        await update.message.reply_text("You are already registered.")
-
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    data = users_ref.child(user_id).get()
-    if data:
-        bal = data.get("balance", 0)
-        ref_count = len(data.get("referrals", []))
-        await update.message.reply_text(f"💰 Balance: ₦{bal}
-👥 Referrals: {ref_count}")
-    else:
-        await update.message.reply_text("You are not registered. Use /start.")
-
-async def refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    ref_link = f"https://t.me/{context.bot.username}?start={user_id}"
-    data = users_ref.child(user_id).get()
-    if data:
-        referrals = data.get("referrals", [])
-        ref_names = "\n".join(referrals) if referrals else "No one yet"
-        await update.message.reply_text(
-            f"🔗 Your Referral Link:
-{ref_link}
-
-"
-            f"👥 Referrals:
-{ref_names}"
-        )
-    else:
-        await update.message.reply_text("Please register using /start.")
-
-async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
+    # Check if user exists
     user_data = users_ref.child(user_id).get()
-    now = datetime.datetime.now(pytz.timezone("Africa/Lagos"))
-    weekday = now.strftime("%A")
-    hour = now.hour
+    new_user = False
+    ip = update.effective_message.effective_attachment or update.message.chat_id  # Use unique placeholder as IP
+    # In real world, you’d extract from headers if using webhook
 
-    if user_data:
-        if user_data["balance"] < 350:
-            await update.message.reply_text("Minimum ₦350 required to withdraw.")
-        elif weekday != "Sunday" or not (19 <= hour < 20):
-            await update.message.reply_text("Withdrawals are allowed only on Sundays between 7–8 PM.")
-        else:
-            context.user_data["withdraw_step"] = 1
-            await update.message.reply_text("Enter your phone number to withdraw:")
-    else:
-        await update.message.reply_text("Use /start to register.")
+    # Referral handling
+    referred_by = None
+    if context.args:
+        referred_by = context.args[0]
+        if referred_by == user_id:
+            referred_by = None  # Prevent self-referral
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    step = context.user_data.get("withdraw_step")
+    if not user_data:
+        new_user = True
+        # Check if this IP already exists in the database
+        existing_users = users_ref.get() or {}
+        ip_exists = any(u.get("ip") == str(ip) for u in existing_users.values())
 
-    if step == 1:
-        context.user_data["phone"] = update.message.text
-        context.user_data["withdraw_step"] = 2
-        await update.message.reply_text("Enter your network (MTN, Airtel, Glo, 9mobile):")
-    elif step == 2:
-        network = update.message.text
-        phone = context.user_data["phone"]
-
-        withdrawal = {
-            "user_id": user_id,
-            "username": update.effective_user.username,
-            "phone": phone,
-            "network": network,
-            "amount": 350,
-            "status": "pending",
-            "timestamp": str(datetime.datetime.now())
+        # Create new user
+        user_data = {
+            "id": user_id,
+            "username": user.username or "",
+            "balance": 0,
+            "referrals": [],
+            "ip": str(ip),
+            "referred_by": referred_by,
+            "joined": str(datetime.utcnow()),
+            "withdrawals": [],
         }
-        withdrawals_ref.push(withdrawal)
 
-        user_data = users_ref.child(user_id).get()
-        user_data["balance"] -= 350
-        user_data["withdrawals"].append(withdrawal)
+        # Give bonus only if referred and IP not used
+        if referred_by and not ip_exists:
+            ref_user = users_ref.child(referred_by).get()
+            if ref_user:
+                ref_user.setdefault("balance", 0)
+                ref_user["balance"] += 50
+                ref_user.setdefault("referrals", [])
+                ref_user["referrals"].append(user.username or f"User{user_id}")
+                users_ref.child(referred_by).update({
+                    "balance": ref_user["balance"],
+                    "referrals": ref_user["referrals"]
+                })
+                await update.message.reply_text("✅ Referral bonus added to your inviter.")
+            else:
+                await update.message.reply_text("⚠️ Referral ID invalid.")
+
         users_ref.child(user_id).set(user_data)
-
-        context.user_data["withdraw_step"] = None
-        await update.message.reply_text("✅ Withdrawal request submitted. Await admin approval.")
-
-async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    data = users_ref.child(user_id).get()
-    if data:
-        refs = data.get("referrals", [])
-        wds = data.get("withdrawals", [])
-
-        ref_text = "\n".join(refs) if refs else "No referrals yet"
-        wd_text = "\n".join([f"{w['amount']} to {w['phone']} - {w['status']}" for w in wds]) if wds else "No withdrawals yet"
-        await update.message.reply_text(f"👥 Referral History:
-{ref_text}
-
-💸 Withdrawal History:
-{wd_text}")
+        await update.message.reply_text("🎉 Welcome! Your account has been created.")
     else:
-        await update.message.reply_text("Please register using /start.")
+        await update.message.reply_text("👋 Welcome back!")
 
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("balance", balance))
-app.add_handler(CommandHandler("refer", refer))
-app.add_handler(CommandHandler("withdraw", withdraw))
-app.add_handler(CommandHandler("history", history))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-app.run_polling()
+    # Check if user is in the group
+    try:
+        member = await context.bot.get_chat_member(chat_id=GROUP_USERNAME, user_id=user.id)
+        if member.status not in ["member", "administrator", "creator"]:
+            await update.message.reply_text(f"❌ Please join our group {GROUP_USERNAME} before using the bot.")
+            return
+    except Exception:
+        await update.message.reply_text("⚠️ Error verifying group membership.")
+        return
+
+    # Show balance
+    balance = users_ref.child(user_id).child("balance").get()
+    await update.message.reply_text(f"💰 Your current balance: {balance} credits")
+
+# /withdraw command
+async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = str(user.id)
+    user_data = users_ref.child(user_id).get()
+
+    if not user_data:
+        await update.message.reply_text("⚠️ You are not registered. Use /start first.")
+        return
+
+    # Prevent multiple pending withdrawals
+    for w in user_data.get("withdrawals", []):
+        if w["status"] == "pending":
+            await update.message.reply_text("⏳ You already have a pending withdrawal request.")
+            return
+
+    if user_data["balance"] < 100:
+        await update.message.reply_text("❌ Minimum withdrawal is 100 credits.")
+        return
+
+    # Deduct and create withdrawal request
+    new_balance = user_data["balance"] - 100
+    users_ref.child(user_id).update({"balance": new_balance})
+
+    withdrawal_request = {
+        "user_id": user_id,
+        "username": user.username,
+        "amount": 100,
+        "status": "pending",
+        "time": str(datetime.utcnow()),
+    }
+
+    withdrawal_key = withdrawals_ref.push(withdrawal_request).key
+
+    user_data["withdrawals"].append({
+        "id": withdrawal_key,
+        "amount": 100,
+        "status": "pending"
+    })
+    users_ref.child(user_id).update({"withdrawals": user_data["withdrawals"]})
+
+    await update.message.reply_text("✅ Withdrawal request submitted for 100 credits. Admin will review it.")
+
+# /balance command
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = str(user.id)
+    balance = users_ref.child(user_id).child("balance").get() or 0
+    await update.message.reply_text(f"💰 Your balance: {balance} credits")
+
+# /referrals command
+async def referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = str(user.id)
+    user_data = users_ref.child(user_id).get()
+
+    if not user_data:
+        await update.message.reply_text("⚠️ You are not registered.")
+        return
+
+    referral_link = f"https://t.me/{context.bot.username}?start={user_id}"
+    referrals = user_data.get("referrals", [])
+
+    await update.message.reply_text(
+        f"📢 Invite friends with your referral link:\n{referral_link}\n\n"
+        f"👥 You have referred: {len(referrals)} users\n"
+        f"🧾 List: {', '.join(referrals) if referrals else 'None'}"
+    )
+
+# /admin placeholder
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🛠 Admin panel is not implemented yet.")
+
+# --- BOT LAUNCH ---
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("withdraw", withdraw))
+    app.add_handler(CommandHandler("balance", balance))
+    app.add_handler(CommandHandler("referrals", referrals))
+    app.add_handler(CommandHandler("admin", admin))
+
+    print("✅ Bot is running...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
