@@ -15,7 +15,7 @@ load_dotenv()
 firebase_config = json.loads(os.environ.get("FIREBASE_CREDENTIALS"))
 
 cred = credentials.Certificate(firebase_config)
-
+firebase_config["private_key"] = firebase_config["private_key"].replace("\\n", "\n")
 if not firebase_admin._apps:
     firebase_admin.initialize_app(cred, {
         "databaseURL": os.getenv("FIREBASE_URL")
