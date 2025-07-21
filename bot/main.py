@@ -12,8 +12,8 @@ import logging
 load_dotenv()
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-FIREBASE_CREDENTIALS = json.loads(os.environ["FIREBASE_CREDENTIALS"])
-FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL")
+
+FIREBASE_DB_URL = os.environ.get("FIREBASE_URL")
 GROUP_USERNAME = os.environ.get("GROUP_USERNAME")  # e.g., "@YourGroup"
 
 
