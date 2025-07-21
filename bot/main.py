@@ -16,10 +16,13 @@ FIREBASE_CREDENTIALS = json.loads(os.environ["FIREBASE_CREDENTIALS"])
 FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL")
 GROUP_USERNAME = os.environ.get("GROUP_USERNAME")  # e.g., "@YourGroup"
 
-# Firebase initialization
-cred = credentials.Certificate(FIREBASE_CREDENTIALS)
-firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
 
+
+# Firebase initialization
+firebase_config = json.loads(os.environ.get("FIREBASE_CREDENTIALS"))
+firebase_config["private_key"] = firebase_config["private_key"].replace("\\n", "\n")
+cred = credentials.Certificate(firebase_config)
+firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
 # Setup database references
 users_ref = db.reference("users")
 withdrawals_ref = db.reference("withdrawals")
