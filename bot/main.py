@@ -14,10 +14,17 @@ FIREBASE_URL = os.getenv("FIREBASE_URL")
 GROUP_USERNAME = "@vvcmmbn"
 WHATSAPP_LINK = "https://chat.whatsapp.com/LuidM3j71mDHzeKRZNIJpG"
 
-# Initialize Firebase
-cred = credentials.Certificate("firebase/firebase_config.json")
+
+
+# Load Firebase credentials from environment variable
+firebase_config = json.loads(os.environ.get("FIREBASE_CREDENTIALS"))
+
+cred = credentials.Certificate(firebase_config)
+
 if not firebase_admin._apps:
-    initialize_app(cred, {"databaseURL": FIREBASE_URL})
+    firebase_admin.initialize_app(cred, {
+        "databaseURL": os.getenv("FIREBASE_URL")
+    })
 
 # DB References
 users_ref = db.reference("users")
