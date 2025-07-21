@@ -8,19 +8,11 @@ import json
 
 load_dotenv()
 
-# ✅ Firebase setup
-# Load Firebase credentials from environment variable
+# ✅ Firebase setups 
+
 firebase_config = json.loads(os.environ.get("FIREBASE_CREDENTIALS"))
-
-# Fix private_key newlines
-firebase_config["private_key"] = firebase_config["private_key"].replace("\\n", "\n")
-
-# Initialize Firebase app only once
-if not firebase_admin._apps:
-    cred = credentials.Certificate(firebase_config)
-    firebase_admin.initialize_app(cred, {
-        "databaseURL": os.getenv("FIREBASE_URL")
-    })
+firebase_config["private_key"] = firebase_config["private_key"].replace("\\n", "\n")  # FIX
+cred = credentials.Certificate(firebase_config)
 
 # ✅ Flask setup
 app = Flask(__name__)
@@ -86,5 +78,6 @@ def logout():
     session.clear()
     return redirect("/")
 
+
 if __name__ == "__main__":
-    app.run(debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
