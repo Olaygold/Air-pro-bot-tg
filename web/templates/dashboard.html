@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Admin Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="container">
+    <h2>Withdrawal Requests</h2>
+    <a href="/logout" class="logout-btn">Logout</a>
+    {% if withdrawals %}
+      <table>
+        <thead>
+          <tr>
+            <th>User</th>
+            <th>Amount</th>
+            <th>Status</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for id, w in withdrawals.items() %}
+            <tr>
+              <td>{{ w.username }}</td>
+              <td>₦{{ w.amount }}</td>
+              <td>{{ w.status }}</td>
+              <td>
+                {% if w.status != "paid" %}
+                  <a href="/mark_paid/{{ id }}" class="btn">Mark as Paid</a>
+                {% else %}
+                  <span class="paid">Paid</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p>No withdrawal requests.</p>
+    {% endif %}
+  </div>
+</body>
+</html>
