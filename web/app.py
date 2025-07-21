@@ -6,28 +6,31 @@ import os
 import requests
 import json
 
+# Load .env file
 load_dotenv()
 
-# ✅ Firebase setups 
+# ✅ Firebase setup
+firebase_credentials = os.getenv("FIREBASE_CREDENTIALS")
+if not firebase_credentials:
+    raise Exception("Missing FIREBASE_CREDENTIALS environment variable!")
 
-firebase_config = json.loads(os.environ.get("FIREBASE_CREDENTIALS"))
-firebase_config["private_key"] = firebase_config["private_key"].replace("\\n", "\n")  # FIX
-cred = credentials.Certificate(firebase_config)
+firebase_config = json.loads(firebase_credentials)
+firebase_config["private_key"] = firebase_config["private_key"].replace("\\n", "\n")
 
-
-# Initialize Firebase app once
 if not firebase_admin._apps:
     cred = credentials.Certificate(firebase_config)
     firebase_admin.initialize_app(cred, {
-        "databaseURL": os.environ.get("FIREBASE_URL")
+        "databaseURL": os.getenv("FIREBASE_URL")
     })
 
 # ✅ Flask setup
 app = Flask(__name__)
-app.secret_key = "supersecret"
+app.secret_key = os.getenv("FLASK_SECRET", "supersecretkey")
 
 # ✅ Telegram bot setup
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise Exception("Missing BOT_TOKEN environment variable!")
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
 # ✅ Login route
@@ -41,7 +44,7 @@ def login():
             return redirect("/dashboard")
     return render_template("login.html")
 
-# ✅ Dashboard
+# ✅ Dashboard route
 @app.route("/dashboard")
 def dashboard():
     if not session.get("admin"):
@@ -59,10 +62,8 @@ def mark_paid(withdrawal_id):
     data = withdrawal_ref.get()
 
     if data:
-        # Update status
         withdrawal_ref.update({"status": "Paid"})
 
-        # Notify user
         user_id = data.get("telegram_id")
         amount = data.get("amount")
         if user_id:
@@ -70,22 +71,22 @@ def mark_paid(withdrawal_id):
     
     return redirect("/dashboard")
 
-# ✅ Telegram notification function
+# ✅ Notify user via Telegram
 def notify_user(chat_id, text):
     try:
         requests.post(TG_API, json={
             "chat_id": chat_id,
             "text": text
         })
-    except:
-        pass  # Ignore notification errors
+    except Exception as e:
+        print(f"Failed to notify user: {e}")
 
-# ✅ Logout
+# ✅ Logout route
 @app.route("/logout")
 def logout():
     session.clear()
     return redirect("/")
 
-
+# ✅ Run server
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
