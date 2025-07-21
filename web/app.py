@@ -8,11 +8,17 @@ import requests
 load_dotenv()
 
 # Firebase setup
-cred = credentials.Certificate("firebase/firebase_config.json")
+
+# Load Firebase credentials from environment variable
+firebase_config = json.loads(os.environ.get("FIREBASE_CREDENTIALS"))
+
+cred = credentials.Certificate(firebase_config)
+
 if not firebase_admin._apps:
     firebase_admin.initialize_app(cred, {
         "databaseURL": os.getenv("FIREBASE_URL")
     })
+
 
 # Flask setup
 app = Flask(__name__)
