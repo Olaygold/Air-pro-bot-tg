@@ -6,30 +6,31 @@ import os
 import requests
 import json
 
-
 load_dotenv()
 
-# Firebase setup
-
+# ✅ Firebase setup
 # Load Firebase credentials from environment variable
 firebase_config = json.loads(os.environ.get("FIREBASE_CREDENTIALS"))
 
-cred = credentials.Certificate(firebase_config)
+# Fix private_key newlines
 firebase_config["private_key"] = firebase_config["private_key"].replace("\\n", "\n")
+
+# Initialize Firebase app only once
 if not firebase_admin._apps:
+    cred = credentials.Certificate(firebase_config)
     firebase_admin.initialize_app(cred, {
         "databaseURL": os.getenv("FIREBASE_URL")
     })
 
-# Flask setup
+# ✅ Flask setup
 app = Flask(__name__)
 app.secret_key = "supersecret"
 
-# Telegram bot token
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # set this in your .env
+# ✅ Telegram bot setup
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-# Login route
+# ✅ Login route
 @app.route("/", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
@@ -40,7 +41,7 @@ def login():
             return redirect("/dashboard")
     return render_template("login.html")
 
-# Dashboard
+# ✅ Dashboard
 @app.route("/dashboard")
 def dashboard():
     if not session.get("admin"):
@@ -48,7 +49,7 @@ def dashboard():
     withdrawals = db.reference("withdrawals").get() or {}
     return render_template("dashboard.html", withdrawals=withdrawals)
 
-# Mark as paid route
+# ✅ Mark withdrawal as paid
 @app.route("/mark_paid/<withdrawal_id>", methods=["POST"])
 def mark_paid(withdrawal_id):
     if not session.get("admin"):
@@ -69,7 +70,7 @@ def mark_paid(withdrawal_id):
     
     return redirect("/dashboard")
 
-# Telegram notification function
+# ✅ Telegram notification function
 def notify_user(chat_id, text):
     try:
         requests.post(TG_API, json={
@@ -79,7 +80,7 @@ def notify_user(chat_id, text):
     except:
         pass  # Ignore notification errors
 
-# Logout
+# ✅ Logout
 @app.route("/logout")
 def logout():
     session.clear()
