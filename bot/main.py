@@ -186,10 +186,11 @@ def home():
     return "✅ Airtime Drop Bot is running."
 
 @app.route("/webhook", methods=["POST"])
-def webhook():
+async def webhook():
     update = Update.de_json(request.get_json(force=True), application.bot)
-    application.update_queue.put(update)
+    await application.process_update(update)
     return "ok"
+
 
 # Set webhook on startup
 @app.before_first_request
