@@ -2,6 +2,7 @@ import os, json, logging
 from dotenv import load_dotenv
 from datetime import datetime
 from fastapi import FastAPI, Request
+from contextlib import asynccontextmanager
 from firebase_admin import credentials, initialize_app, db
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -32,16 +33,31 @@ withdrawals_ref = db.reference("withdrawals")
 # Logging
 logging.basicConfig(level=logging.INFO)
 
-# FastAPI app
-app = FastAPI()
-
-# Telegram app
+# Telegram bot app
 telegram_app = Application.builder().token(BOT_TOKEN).rate_limiter(AIORateLimiter()).build()
 
+# Lifespan hook for setting webhook
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("🌐 Setting webhook...")
+    await telegram_app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
+    print("✅ Webhook set.")
+    yield
+
+# FastAPI app instance
+app = FastAPI(lifespan=lifespan)
+
+# Telegram webhook route
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    update = Update.de_json(await request.json(), telegram_app.bot)
+    await telegram_app.process_update(update)
+    return {"status": "ok"}
+
+# === BOT HANDLERS ===
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    user_id = str(user.id)
     text = (
         "🚀 *Welcome to Air Pro Reward Bot!*\n\n"
         "💰 Earn ₦50 by joining our Telegram group.\n"
@@ -54,7 +70,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=buttons)
 
-
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = query.from_user
@@ -65,10 +80,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             member = await context.bot.get_chat_member(chat_id=GROUP_USERNAME, user_id=user.id)
             if member.status in ["member", "administrator", "creator"]:
-                # Next: Ask to join WhatsApp
-                buttons = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📲 I’ve Joined WhatsApp", callback_data="verify_whatsapp")]
-                ])
                 await query.edit_message_text(
                     "✅ Group join verified!\n\nNow please join our *WhatsApp group* for updates:",
                     parse_mode="Markdown",
@@ -92,7 +103,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if referred_by == user_id:
                 referred_by = None
 
-        ip = str(user.id)  # Simplified placeholder IP
+        ip = str(user.id)  # Placeholder IP
 
         if not user_data:
             all_users = users_ref.get() or {}
@@ -109,7 +120,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "withdrawals": []
             }
 
-            # Handle referral bonus
             if referred_by and not ip_used:
                 ref_user = users_ref.child(referred_by).get()
                 if ref_user:
@@ -131,7 +141,6 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     balance = users_ref.child(user_id).child("balance").get() or 0
     await update.message.reply_text(f"💰 Your balance is ₦{balance}")
 
-
 async def referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     data = users_ref.child(user_id).get()
@@ -146,7 +155,6 @@ async def referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🧾 Users: {', '.join(referred) if referred else 'None'}",
         parse_mode="Markdown"
     )
-
 
 async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -179,7 +187,6 @@ async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("✅ Withdrawal request submitted and pending approval.")
 
-
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔐 Admin panel coming soon.")
 
@@ -190,25 +197,3 @@ telegram_app.add_handler(CommandHandler("balance", balance))
 telegram_app.add_handler(CommandHandler("referrals", referrals))
 telegram_app.add_handler(CommandHandler("withdraw", withdraw))
 telegram_app.add_handler(CommandHandler("admin", admin))
-
-# Webhook route
-@app.post("/webhook")
-async def telegram_webhook(request: Request):
-    update = Update.de_json(await request.json(), telegram_app.bot)
-    await telegram_app.process_update(update)
-    return {"status": "ok"}
-
-
-
-
-
-
-from contextlib import asynccontextmanager
-from fastapi import FastAPI
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await telegram_app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
-    yield  # Keeps the app alive
-
-app = FastAPI(lifespan=lifespan)
