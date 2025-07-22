@@ -1,8 +1,7 @@
 import os, json, logging
 from dotenv import load_dotenv
 from datetime import datetime
-from fastapi import FastAPI, Request
-from contextlib import asynccontextmanager
+from flask import Flask, request
 from firebase_admin import credentials, initialize_app, db
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -13,15 +12,15 @@ from telegram.ext import (
     AIORateLimiter,
 )
 
-# Load env vars
+# Load env
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 FIREBASE_URL = os.getenv("FIREBASE_URL")
 GROUP_USERNAME = os.getenv("GROUP_USERNAME")
 WHATSAPP_LINK = os.getenv("WHATSAPP_LINK")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g., https://your-app.onrender.com
 
-# Firebase init
+# Init Firebase
 firebase_config = json.loads(os.getenv("FIREBASE_CREDENTIALS"))
 firebase_config["private_key"] = firebase_config["private_key"].replace("\\n", "\n")
 cred = credentials.Certificate(firebase_config)
@@ -33,31 +32,14 @@ withdrawals_ref = db.reference("withdrawals")
 # Logging
 logging.basicConfig(level=logging.INFO)
 
-# Telegram bot app
+# Flask app
+app = Flask(__name__)
+
+# Telegram App
 telegram_app = Application.builder().token(BOT_TOKEN).rate_limiter(AIORateLimiter()).build()
 
-# Lifespan hook for setting webhook
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    print("🌐 Setting webhook...")
-    await telegram_app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
-    print("✅ Webhook set.")
-    yield
-
-# FastAPI app instance
-app = FastAPI(lifespan=lifespan)
-
-# Telegram webhook route
-@app.post("/webhook")
-async def telegram_webhook(request: Request):
-    update = Update.de_json(await request.json(), telegram_app.bot)
-    await telegram_app.process_update(update)
-    return {"status": "ok"}
-
-# === BOT HANDLERS ===
-
+# === HANDLERS ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
     text = (
         "🚀 *Welcome to Air Pro Reward Bot!*\n\n"
         "💰 Earn ₦50 by joining our Telegram group.\n"
@@ -103,7 +85,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if referred_by == user_id:
                 referred_by = None
 
-        ip = str(user.id)  # Placeholder IP
+        ip = str(user.id)  # Fake IP for now
 
         if not user_data:
             all_users = users_ref.get() or {}
@@ -190,10 +172,23 @@ async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔐 Admin panel coming soon.")
 
-# Add handlers
+# Register handlers
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CallbackQueryHandler(button_handler))
 telegram_app.add_handler(CommandHandler("balance", balance))
 telegram_app.add_handler(CommandHandler("referrals", referrals))
 telegram_app.add_handler(CommandHandler("withdraw", withdraw))
 telegram_app.add_handler(CommandHandler("admin", admin))
+
+# Flask route for webhook
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+    telegram_app.create_task(telegram_app.process_update(update))
+    return "ok"
+
+# Start webhook when Flask starts
+@app.before_first_request
+def init_webhook():
+    telegram_app.run_polling()  # Or skip this if using Render webhook only
+    telegram_app.bot.set_webhook(f"{WEBHOOK_URL}/webhook")
