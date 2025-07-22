@@ -198,7 +198,17 @@ async def telegram_webhook(request: Request):
     await telegram_app.process_update(update)
     return {"status": "ok"}
 
-# Set webhook on startup
-@app.on_event("startup")
-async def on_startup():
+
+
+
+
+
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     await telegram_app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
+    yield  # Keeps the app alive
+
+app = FastAPI(lifespan=lifespan)
