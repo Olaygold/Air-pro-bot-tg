@@ -1,197 +1,204 @@
-import os
-import json
-import logging
+import os, json, logging
 from dotenv import load_dotenv
 from datetime import datetime
-import firebase_admin
-from firebase_admin import credentials, db
+from fastapi import FastAPI, Request
+from firebase_admin import credentials, initialize_app, db
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    AIORateLimiter,
+)
 
-# Load environment variables
+# Load env vars
 load_dotenv()
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-FIREBASE_DB_URL = os.environ.get("FIREBASE_URL")
-GROUP_USERNAME = os.environ.get("GROUP_USERNAME")  # e.g. @vvcmmbn
-WHATSAPP_LINK = os.environ.get("WHATSAPP_LINK")  # e.g. https://chat.whatsapp.com/...
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+FIREBASE_URL = os.getenv("FIREBASE_URL")
+GROUP_USERNAME = os.getenv("GROUP_USERNAME")
+WHATSAPP_LINK = os.getenv("WHATSAPP_LINK")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-# Firebase initialization
-firebase_config = json.loads(os.environ.get("FIREBASE_CREDENTIALS"))
+# Firebase init
+firebase_config = json.loads(os.getenv("FIREBASE_CREDENTIALS"))
 firebase_config["private_key"] = firebase_config["private_key"].replace("\\n", "\n")
 cred = credentials.Certificate(firebase_config)
-firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
+initialize_app(cred, {"databaseURL": FIREBASE_URL})
 
-# DB References
 users_ref = db.reference("users")
 withdrawals_ref = db.reference("withdrawals")
 
 # Logging
 logging.basicConfig(level=logging.INFO)
 
-# Start command
+# FastAPI app
+app = FastAPI()
+
+# Telegram app
+telegram_app = Application.builder().token(BOT_TOKEN).rate_limiter(AIORateLimiter()).build()
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = str(user.id)
-    username = user.username or f"User{user_id}"
-    ip = update.message.chat_id  # Placeholder for IP tracking
-
-    # Show bot intro and ask them to join group
-    intro = (
-        "🚀 *Welcome to air pro Reward Bot!*\n\n"
-        "💰 Earn ₦50 instantly for joining our Telegram group.\n"
-        "👥 Refer your friends to earn even more.\n"
-        "🎉 Withdraw once your balance reaches ₦350.\n\n"
-        "👉 Let's start by joining the Telegram group:"
+    text = (
+        "🚀 *Welcome to Air Pro Reward Bot!*\n\n"
+        "💰 Earn ₦50 by joining our Telegram group.\n"
+        "👥 Refer your friends and earn more.\n"
+        "🎉 Withdraw when your balance hits ₦350.\n\n"
+        "👉 Tap below to join the group:"
     )
+    buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ I’ve Joined the Group", callback_data="verify_group")]
+    ])
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=buttons)
 
-    button = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ I’ve Joined the Group", callback_data="verify_join")
-    ]])
-    await update.message.reply_text(intro, parse_mode="Markdown", reply_markup=button)
 
-# Verify if user joined group
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     user = query.from_user
     user_id = str(user.id)
+    await query.answer()
 
-    if query.data == "verify_join":
+    if query.data == "verify_group":
         try:
             member = await context.bot.get_chat_member(chat_id=GROUP_USERNAME, user_id=user.id)
             if member.status in ["member", "administrator", "creator"]:
-                # Proceed with registration or welcome
-                user_data = users_ref.child(user_id).get()
-                ip = user.id
-
-                referred_by = None
-                if context.args:
-                    referred_by = context.args[0]
-                    if referred_by == user_id:
-                        referred_by = None
-
-                if not user_data:
-                    existing_users = users_ref.get() or {}
-                    ip_exists = any(u.get("ip") == str(ip) for u in existing_users.values())
-
-                    user_data = {
-                        "id": user_id,
-                        "username": user.username or "",
-                        "balance": 50,
-                        "referrals": [],
-                        "ip": str(ip),
-                        "referred_by": referred_by,
-                        "joined": str(datetime.utcnow()),
-                        "withdrawals": [],
-                    }
-
-                    # If referred and IP not reused
-                    if referred_by and not ip_exists:
-                        ref_user = users_ref.child(referred_by).get()
-                        if ref_user:
-                            ref_user.setdefault("balance", 0)
-                            ref_user["balance"] += 50
-                            ref_user.setdefault("referrals", [])
-                            ref_user["referrals"].append(user.username or f"User{user_id}")
-                            users_ref.child(referred_by).update({
-                                "balance": ref_user["balance"],
-                                "referrals": ref_user["referrals"]
-                            })
-                            await query.edit_message_text("✅ Referral bonus given to your inviter!")
-                    users_ref.child(user_id).set(user_data)
-                    await query.edit_message_text("🎉 You’ve been registered and got ₦50 bonus!")
-
-                else:
-                    await query.edit_message_text("👋 Welcome back!")
-
-                # Show WhatsApp group
-                whatsapp_button = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("📲 Join WhatsApp Group", url=WHATSAPP_LINK)
-                ]])
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text="🎁 Bonus granted! Join our WhatsApp group too for updates:",
-                    reply_markup=whatsapp_button
+                # Next: Ask to join WhatsApp
+                buttons = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📲 I’ve Joined WhatsApp", callback_data="verify_whatsapp")]
+                ])
+                await query.edit_message_text(
+                    "✅ Group join verified!\n\nNow please join our *WhatsApp group* for updates:",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("Join WhatsApp Group", url=WHATSAPP_LINK)],
+                        [InlineKeyboardButton("📲 I’ve Joined WhatsApp", callback_data="verify_whatsapp")]
+                    ])
                 )
-
             else:
-                await query.edit_message_text(f"❌ You must join {GROUP_USERNAME} to continue.")
-
+                await query.edit_message_text("❌ You must join the group to continue.")
         except Exception as e:
+            logging.error(e)
             await query.edit_message_text("⚠️ Couldn’t verify group membership. Try again later.")
 
-# Show balance
+    elif query.data == "verify_whatsapp":
+        user_data = users_ref.child(user_id).get()
+        referred_by = None
+        args = context.args
+        if args:
+            referred_by = args[0]
+            if referred_by == user_id:
+                referred_by = None
+
+        ip = str(user.id)  # Simplified placeholder IP
+
+        if not user_data:
+            all_users = users_ref.get() or {}
+            ip_used = any(u.get("ip") == ip for u in all_users.values())
+
+            user_data = {
+                "id": user_id,
+                "username": user.username or f"user{user_id}",
+                "balance": 50,
+                "referrals": [],
+                "ip": ip,
+                "referred_by": referred_by,
+                "joined": str(datetime.utcnow()),
+                "withdrawals": []
+            }
+
+            # Handle referral bonus
+            if referred_by and not ip_used:
+                ref_user = users_ref.child(referred_by).get()
+                if ref_user:
+                    ref_user.setdefault("balance", 0)
+                    ref_user["balance"] += 50
+                    ref_user.setdefault("referrals", [])
+                    ref_user["referrals"].append(user.username or f"user{user_id}")
+                    users_ref.child(referred_by).update(ref_user)
+
+            users_ref.child(user_id).set(user_data)
+            await query.edit_message_text("🎉 You’ve joined successfully and received ₦50 bonus!")
+        else:
+            await query.edit_message_text("👋 Welcome back! You've already joined.")
+
+        await context.bot.send_message(chat_id=user_id, text="You can now use /balance, /withdraw, /referrals")
+
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     balance = users_ref.child(user_id).child("balance").get() or 0
-    await update.message.reply_text(f"💰 Your balance: ₦{balance}")
+    await update.message.reply_text(f"💰 Your balance is ₦{balance}")
 
-# Show referral link
+
 async def referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    user_data = users_ref.child(user_id).get()
-    if not user_data:
-        await update.message.reply_text("⚠️ You're not registered.")
+    data = users_ref.child(user_id).get()
+    if not data:
+        await update.message.reply_text("❌ You're not registered.")
         return
-
-    referrals = user_data.get("referrals", [])
     ref_link = f"https://t.me/{context.bot.username}?start={user_id}"
+    referred = data.get("referrals", [])
     await update.message.reply_text(
-        f"📢 Invite friends with your referral link:\n`{ref_link}`\n\n"
-        f"👥 You’ve referred: {len(referrals)} users\n"
-        f"🧾 List: {', '.join(referrals) if referrals else 'None'}",
+        f"📢 Your referral link:\n`{ref_link}`\n\n"
+        f"👥 Referrals: {len(referred)}\n"
+        f"🧾 Users: {', '.join(referred) if referred else 'None'}",
         parse_mode="Markdown"
     )
 
-# Withdraw command
+
 async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    user_data = users_ref.child(user_id).get()
-    if not user_data:
-        await update.message.reply_text("⚠️ You’re not registered.")
+    data = users_ref.child(user_id).get()
+    if not data:
+        await update.message.reply_text("❌ You’re not registered.")
         return
 
-    # Pending check
-    for w in user_data.get("withdrawals", []):
+    if data.get("balance", 0) < 350:
+        await update.message.reply_text("⚠️ You need ₦350 minimum to withdraw.")
+        return
+
+    for w in data.get("withdrawals", []):
         if w["status"] == "pending":
             await update.message.reply_text("⏳ You already have a pending withdrawal.")
             return
 
-    if user_data["balance"] < 350:
-        await update.message.reply_text("❌ You need at least ₦350 to withdraw.")
-        return
-
-    # Deduct and save
-    new_balance = user_data["balance"] - 350
+    new_balance = data["balance"] - 350
     users_ref.child(user_id).update({"balance": new_balance})
     withdrawal = {
         "user_id": user_id,
-        "username": update.effective_user.username,
+        "username": data["username"],
         "amount": 350,
         "status": "pending",
         "time": str(datetime.utcnow())
     }
-    key = withdrawals_ref.push(withdrawal).key
-    user_data["withdrawals"].append({"id": key, "amount": 350, "status": "pending"})
-    users_ref.child(user_id).update({"withdrawals": user_data["withdrawals"]})
+    ref_key = withdrawals_ref.push(withdrawal).key
+    data["withdrawals"].append({**withdrawal, "id": ref_key})
+    users_ref.child(user_id).update({"withdrawals": data["withdrawals"]})
 
-    await update.message.reply_text("✅ Withdrawal request submitted. It’ll be reviewed shortly.")
+    await update.message.reply_text("✅ Withdrawal request submitted and pending approval.")
 
-# Admin command (placeholder)
+
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🛠 Admin panel is not implemented yet.")
+    await update.message.reply_text("🔐 Admin panel coming soon.")
 
-# Run bot
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(CommandHandler("balance", balance))
-    app.add_handler(CommandHandler("referrals", referrals))
-    app.add_handler(CommandHandler("withdraw", withdraw))
-    app.add_handler(CommandHandler("admin", admin))
-    print("✅ Bot running...")
-    app.run_polling()
+# Add handlers
+telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(CallbackQueryHandler(button_handler))
+telegram_app.add_handler(CommandHandler("balance", balance))
+telegram_app.add_handler(CommandHandler("referrals", referrals))
+telegram_app.add_handler(CommandHandler("withdraw", withdraw))
+telegram_app.add_handler(CommandHandler("admin", admin))
 
-if __name__ == "__main__":
-    main()
+# Webhook route
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    update = Update.de_json(await request.json(), telegram_app.bot)
+    await telegram_app.process_update(update)
+    return {"status": "ok"}
+
+# Set webhook on startup
+@app.on_event("startup")
+async def on_startup():
+    await telegram_app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
