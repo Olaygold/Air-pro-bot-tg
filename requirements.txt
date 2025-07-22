@@ -1,7 +1,7 @@
-python-telegram-bot[rate-limiter]
-firebase-admin
-flask
-python-dotenv
-requests
-pytz
-fastapi
+python-telegram-bot[ext] == 20.8
+firebase-admin == 6.4.0
+flask == 2.3.3
+python-dotenv == 1.0.1
+requests == 2.31.0
+pytz == 2024.1
+gunicorn == 21.2.0
