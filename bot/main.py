@@ -1,16 +1,14 @@
 import os
 import json
-import logging
 import requests
 from flask import Flask, request
 from dotenv import load_dotenv
 from firebase_admin import credentials, initialize_app, db
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
 from telegram.constants import ChatMemberStatus
-
 
 # Load environment variables
 load_dotenv()
@@ -54,10 +52,7 @@ def has_joined_group(bot, user_id):
         member = bot.get_chat_member(chat_id=GROUP_USERNAME, user_id=user_id)
         return member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
     except:
-        return True  # allow if it fails
-
-def get_ip(update: Update):
-    return update.effective_user.id  # fallback since IP isn't available on Telegram API
+        return True
 
 # Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -76,7 +71,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Please join the Telegram group first: {GROUP_USERNAME}")
         return
 
-    # Register user
     save_user_data(user_id, {
         "id": user_id,
         "username": username,
@@ -86,14 +80,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ref_by": ref_code or ""
     })
 
-    # Reward referrer
     if ref_code and ref_code != user_id:
         ref_user = get_user_data(ref_code)
-        if ref_user:
-            if user_id not in ref_user.get("referrals", []):
-                ref_user["balance"] = ref_user.get("balance", 0) + REFERRAL_BONUS
-                ref_user.setdefault("referrals", []).append(user_id)
-                save_user_data(ref_code, ref_user)
+        if ref_user and user_id not in ref_user.get("referrals", []):
+            ref_user["balance"] = ref_user.get("balance", 0) + REFERRAL_BONUS
+            ref_user.setdefault("referrals", []).append(user_id)
+            save_user_data(ref_code, ref_user)
 
     await update.message.reply_text(
         f"🎉 Welcome {username}! You’ve received ₦{SIGNUP_BONUS} signup bonus.\n\n"
@@ -135,7 +127,6 @@ async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text("📱 Please enter your phone number for airtime:")
-
     context.user_data["withdraw_step"] = "phone"
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -151,7 +142,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         network = update.message.text
         amount = MIN_WITHDRAW
 
-        # Save withdrawal
         ref = db.reference(f"users/{user_id}")
         user_data = ref.get()
         withdrawals = user_data.get("withdrawals", [])
@@ -180,7 +170,7 @@ application.add_handler(CommandHandler("history", history))
 application.add_handler(CommandHandler("withdraw", withdraw))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-# Flask webhook route
+# Webhook route
 @app.route("/")
 def home():
     return "✅ Airtime Drop Bot is running."
@@ -191,8 +181,6 @@ async def webhook():
     await application.process_update(update)
     return "ok"
 
-
-# Set webhook on startup
 @app.before_first_request
 def set_webhook():
     webhook_url = f"{WEBHOOK_URL}/webhook"
@@ -201,6 +189,5 @@ def set_webhook():
         params={"url": webhook_url}
     )
 
-# Run Flask
 if __name__ == "__main__":
     app.run(port=5000)
