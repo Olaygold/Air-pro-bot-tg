@@ -1,16 +1,17 @@
 import os
 import json
+import asyncio
 import requests
 from flask import Flask, request
 from dotenv import load_dotenv
 from firebase_admin import credentials, initialize_app, db
-from telegram import Update
+from telegram import Update, Bot
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ContextTypes, filters
+    Application, CommandHandler, MessageHandler, ContextTypes, filters, AIORateLimiter
 )
 from telegram.constants import ChatMemberStatus
 
-# Load environment variables
+# Load env variables
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_USERNAME = os.getenv("GROUP_USERNAME")
@@ -28,8 +29,8 @@ initialize_app(cred, {"databaseURL": FIREBASE_URL})
 # Flask app
 app = Flask(__name__)
 
-# Telegram Bot setup
-application = Application.builder().token(BOT_TOKEN).build()
+# Telegram bot application (async)
+application = Application.builder().token(BOT_TOKEN).rate_limiter(AIORateLimiter()).build()
 
 # Constants
 SIGNUP_BONUS = 50
@@ -47,12 +48,12 @@ def get_user_data(user_id):
 def save_user_data(user_id, data):
     db.reference(get_user_ref(user_id)).update(data)
 
-def has_joined_group(bot, user_id):
+async def has_joined_group(bot: Bot, user_id: int):
     try:
-        member = bot.get_chat_member(chat_id=GROUP_USERNAME, user_id=user_id)
+        member = await bot.get_chat_member(chat_id=GROUP_USERNAME, user_id=user_id)
         return member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
-    except:
-        return True
+    except Exception:
+        return True  # Assume joined if bot can't verify (e.g., private group)
 
 # Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -66,7 +67,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ You're already registered.")
         return
 
-    joined = has_joined_group(context.bot, user.id)
+    joined = await has_joined_group(context.bot, user.id)
     if not joined:
         await update.message.reply_text(f"❌ Please join the Telegram group first: {GROUP_USERNAME}")
         return
@@ -162,7 +163,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Withdrawal request of ₦{amount} submitted!\n📱 You will receive airtime on {phone} ({network})"
         )
 
-# Add handlers
+# Register handlers
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("balance", balance))
 application.add_handler(CommandHandler("refer", refer))
@@ -170,24 +171,28 @@ application.add_handler(CommandHandler("history", history))
 application.add_handler(CommandHandler("withdraw", withdraw))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-# Webhook route
+# Home route
 @app.route("/")
 def home():
     return "✅ Airtime Drop Bot is running."
 
+# Telegram webhook route
 @app.route("/webhook", methods=["POST"])
-async def webhook():
+async def telegram_webhook():
     update = Update.de_json(request.get_json(force=True), application.bot)
     await application.process_update(update)
     return "ok"
 
+# Set Telegram webhook on first request
 @app.before_first_request
 def set_webhook():
-    webhook_url = f"{WEBHOOK_URL}/webhook"
+    full_url = f"{WEBHOOK_URL}/webhook"
     requests.get(
         f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
-        params={"url": webhook_url}
+        params={"url": full_url}
     )
 
 if __name__ == "__main__":
-    app.run(port=5000)
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
