@@ -10,7 +10,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
 from telegram.constants import ChatMemberStatus
-from telegram.ext.webhookhandler import WebhookHandler
+
 
 # Load environment variables
 load_dotenv()
