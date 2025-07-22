@@ -1,8 +1,6 @@
 python-telegram-bot[rate-limiter]==20.7
 fastapi
 uvicorn
-...
-# other packages you're using
 firebase-admin == 6.4.0
 flask == 2.3.3
 python-dotenv == 1.0.1
