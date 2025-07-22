@@ -4,8 +4,12 @@ services:
     env: python
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python web/app.py"
-  - type: worker
+
+  - type: web  # changed from 'worker' to 'web' so it can receive webhook traffic
     name: telegram-bot
     env: python
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python bot/main.py"
+    routes:
+      - src: /webhook
+        dest: /
