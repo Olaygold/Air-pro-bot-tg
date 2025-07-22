@@ -5,11 +5,12 @@ services:
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python web/app.py"
 
-  - type: web  # changed from 'worker' to 'web' so it can receive webhook traffic
-    name: telegram-bot
-    env: python
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: gunicorn bot.main:app --preload --bind 0.0.0.0:$PORT 
+services:
+  - type: web
+    name: telegram-node-bot
+    env: node
+    buildCommand: "npm install"
+    startCommand: "npm start"
     routes:
       - src: /webhook
         dest: /
