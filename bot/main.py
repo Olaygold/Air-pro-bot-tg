@@ -21,7 +21,9 @@ FIREBASE_URL = os.getenv("FIREBASE_URL")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 # Firebase setup
-cred_data = json.loads(os.getenv("FIREBASE_CREDENTIALS").replace("\\n", "\n"))
+firebase_credentials_raw = os.getenv("FIREBASE_CREDENTIALS")
+firebase_credentials_clean = firebase_credentials_raw.encode().decode('unicode_escape')
+cred_data = json.loads(firebase_credentials_clean)
 cred = credentials.Certificate(cred_data)
 initialize_app(cred, {"databaseURL": FIREBASE_URL})
 
