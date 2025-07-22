@@ -1,206 +1,203 @@
 import os
 import json
-from flask import Flask, request
+import logging
 import requests
+from flask import Flask, request
 from dotenv import load_dotenv
-import firebase_admin
-from firebase_admin import credentials, db
-from telegram import Bot, Update
-from telegram.ext import Dispatcher, CommandHandler
+from firebase_admin import credentials, initialize_app, db
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ContextTypes, filters
+)
+from telegram.constants import ChatMemberStatus
+from telegram.ext.webhookhandler import WebhookHandler
 
 # Load environment variables
 load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROUP_USERNAME = os.getenv("GROUP_USERNAME")
+WHATSAPP_LINK = os.getenv("WHATSAPP_LINK")
+FIREBASE_URL = os.getenv("FIREBASE_URL")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 # Firebase setup
-firebase_config = json.loads(os.environ.get("FIREBASE_CREDENTIALS"))
-firebase_config["private_key"] = firebase_config["private_key"].replace("\\n", "\n")
-cred = credentials.Certificate(firebase_config)
-
-if not firebase_admin._apps:
-    firebase_admin.initialize_app(cred, {
-        "databaseURL": os.environ.get("FIREBASE_URL")
-    })
+cred_data = json.loads(os.getenv("FIREBASE_CREDENTIALS").replace("\\n", "\n"))
+cred = credentials.Certificate(cred_data)
+initialize_app(cred, {"databaseURL": FIREBASE_URL})
 
 # Flask app
 app = Flask(__name__)
-TOKEN = os.getenv("BOT_TOKEN")
-bot = Bot(token=TOKEN)
 
-# Dispatcher
-dispatcher = Dispatcher(bot=bot, update_queue=None, use_context=True)
+# Telegram Bot setup
+application = Application.builder().token(BOT_TOKEN).build()
 
 # Constants
-WHATSAPP_LINK = os.getenv("WHATSAPP_LINK")
-GROUP_USERNAME = os.getenv("GROUP_USERNAME")
+SIGNUP_BONUS = 50
+REFERRAL_BONUS = 50
+MIN_WITHDRAW = 350
 
-# Helper
-def get_user_ip(update):
+# Utils
+def get_user_ref(user_id):
+    return f"users/{user_id}"
+
+def get_user_data(user_id):
+    ref = db.reference(get_user_ref(user_id))
+    return ref.get() or {}
+
+def save_user_data(user_id, data):
+    db.reference(get_user_ref(user_id)).update(data)
+
+def has_joined_group(bot, user_id):
     try:
-        return request.remote_addr
+        member = bot.get_chat_member(chat_id=GROUP_USERNAME, user_id=user_id)
+        return member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
     except:
-        return "unknown"
+        return True  # allow if it fails
 
-def is_user_in_group(user_id):
-    url = f"https://api.telegram.org/bot{TOKEN}/getChatMember"
-    params = {"chat_id": f"@{GROUP_USERNAME}", "user_id": user_id}
-    response = requests.get(url, params=params)
-    result = response.json()
-    if result.get("ok"):
-        return result["result"]["status"] in ["member", "administrator", "creator"]
-    return False
+def get_ip(update: Update):
+    return update.effective_user.id  # fallback since IP isn't available on Telegram API
 
-# === COMMAND HANDLERS ===
-
-def start(update, context):
-    user = update.effective_user
-    args = context.args
-    user_id = str(user.id)
-    ip_address = get_user_ip(update)
-    referred_by = args[0] if args else None
-
-    user_ref = db.reference(f"/users/{user_id}")
-    if user_ref.get():
-        update.message.reply_text("✅ You are already registered.")
-        return
-
-    bonus = 500
-    refer_bonus = 0
-
-    if referred_by and referred_by != user_id:
-        referred_ip_ref = db.reference(f"/users/{referred_by}/referred_ips/{ip_address}")
-        if not referred_ip_ref.get():
-            refer_bonus = 50
-            referred_ip_ref.set(True)
-
-    user_data = {
-        "username": user.username or "",
-        "full_name": user.full_name,
-        "ip": ip_address,
-        "balance": bonus,
-        "referred_by": referred_by or "",
-        "ref_code": user_id,
-    }
-    user_ref.set(user_data)
-
-    if referred_by and refer_bonus > 0:
-        ref_bal = db.reference(f"/users/{referred_by}/balance")
-        current = ref_bal.get() or 0
-        ref_bal.set(current + refer_bonus)
-
-    reply = f"🎉 Welcome {user.first_name}!\n\nYou’ve received ₦{bonus} signup bonus."
-    if refer_bonus:
-        reply += f"\n\n👥 Your referrer earned ₦{refer_bonus}."
-
-    reply += f"\n\n🔗 Join group: https://t.me/{GROUP_USERNAME}"
-    reply += f"\n📱 WhatsApp: {WHATSAPP_LINK}"
-    context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
-
-def balance(update, context):
-    user_id = str(update.effective_user.id)
-    user = db.reference(f"/users/{user_id}").get()
-    if not user:
-        update.message.reply_text("❌ You are not registered.")
-        return
-    bal = user.get("balance", 0)
-    update.message.reply_text(f"💰 Your current balance is ₦{bal}")
-
-def refer(update, context):
+# Handlers
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = str(user.id)
-    link = f"https://t.me/{bot.username}?start={user_id}"
-    update.message.reply_text(f"🔗 Your referral link:\n{link}")
+    username = user.first_name
+    ref_code = context.args[0] if context.args else None
+    user_data = get_user_data(user_id)
 
-def withdraw(update, context):
-    user_id = str(update.effective_user.id)
-    args = context.args
-    if not args:
-        update.message.reply_text("❗ Use like: /withdraw 100")
+    if user_data:
+        await update.message.reply_text("✅ You're already registered.")
         return
 
-    try:
-        amount = int(args[0])
-    except:
-        update.message.reply_text("❗ Invalid amount")
+    joined = has_joined_group(context.bot, user.id)
+    if not joined:
+        await update.message.reply_text(f"❌ Please join the Telegram group first: {GROUP_USERNAME}")
         return
 
-    user_ref = db.reference(f"/users/{user_id}")
-    user = user_ref.get()
-    if not user:
-        update.message.reply_text("❌ You are not registered.")
-        return
-
-    balance = user.get("balance", 0)
-    if amount > balance:
-        update.message.reply_text("❌ Insufficient balance.")
-        return
-
-    # Deduct
-    user_ref.child("balance").set(balance - amount)
-
-    # Log withdrawal
-    db.reference(f"/withdrawals/{user_id}").push({
-        "amount": amount,
-        "username": user.get("username", ""),
-        "status": "pending"
+    # Register user
+    save_user_data(user_id, {
+        "id": user_id,
+        "username": username,
+        "balance": SIGNUP_BONUS,
+        "referrals": [],
+        "withdrawals": [],
+        "ref_by": ref_code or ""
     })
 
-    update.message.reply_text(f"✅ Withdrawal of ₦{amount} requested. You will be paid soon!")
+    # Reward referrer
+    if ref_code and ref_code != user_id:
+        ref_user = get_user_data(ref_code)
+        if ref_user:
+            if user_id not in ref_user.get("referrals", []):
+                ref_user["balance"] = ref_user.get("balance", 0) + REFERRAL_BONUS
+                ref_user.setdefault("referrals", []).append(user_id)
+                save_user_data(ref_code, ref_user)
 
-def history(update, context):
+    await update.message.reply_text(
+        f"🎉 Welcome {username}! You’ve received ₦{SIGNUP_BONUS} signup bonus.\n\n"
+        f"👥 Join Telegram Group: https://t.me/{GROUP_USERNAME.lstrip('@')}\n"
+        f"📱 WhatsApp Group (optional): {WHATSAPP_LINK}"
+    )
+
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    withdraws = db.reference(f"/withdrawals/{user_id}").get() or {}
-    refers = db.reference(f"/users/{user_id}/referred_ips").get() or {}
+    balance = get_user_data(user_id).get("balance", 0)
+    await update.message.reply_text(f"💰 Your current balance is ₦{balance}")
 
-    history_msg = "📜 *Your History*\n\n"
-    history_msg += f"👥 Referrals: {len(refers)} users\n"
-    history_msg += "💸 Withdrawals:\n"
+async def refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    link = f"https://t.me/{context.bot.username}?start={user_id}"
+    await update.message.reply_text(f"🔗 Your referral link:\n{link}")
 
-    for w in withdraws.values():
-        history_msg += f" - ₦{w['amount']} ({w['status']})\n"
+async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    user_data = get_user_data(user_id)
+    referrals = user_data.get("referrals", [])
+    withdrawals = user_data.get("withdrawals", [])
 
-    update.message.reply_text(history_msg, parse_mode="Markdown")
+    text = f"👥 Referrals: {len(referrals)}\n📜 Withdrawal History:\n"
+    if not withdrawals:
+        text += "❌ No withdrawals yet."
+    else:
+        for w in withdrawals:
+            text += f"• ₦{w['amount']} to {w['phone']} ({w['network']}) - {w['status']}\n"
+    await update.message.reply_text(text)
 
-def setbalance(update, context):
-    admin_ids = os.getenv("ADMIN_IDS", "").split(",")  # e.g. "12345,67890"
-    if str(update.effective_user.id) not in admin_ids:
-        update.message.reply_text("❌ You are not authorized.")
+async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    user_data = get_user_data(user_id)
+    balance = user_data.get("balance", 0)
+
+    if balance < MIN_WITHDRAW:
+        await update.message.reply_text(f"❌ You need at least ₦{MIN_WITHDRAW} to withdraw.")
         return
 
-    if len(context.args) < 2:
-        update.message.reply_text("Use: /setbalance <username> <amount>")
-        return
+    await update.message.reply_text("📱 Please enter your phone number for airtime:")
 
-    username = context.args[0].replace("@", "")
-    amount = int(context.args[1])
+    context.user_data["withdraw_step"] = "phone"
 
-    users = db.reference("/users").get()
-    for uid, u in users.items():
-        if u.get("username") == username:
-            db.reference(f"/users/{uid}/balance").set(amount)
-            update.message.reply_text(f"✅ Set {username}'s balance to ₦{amount}")
-            return
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    step = context.user_data.get("withdraw_step")
+    user_id = str(update.effective_user.id)
 
-    update.message.reply_text("❌ User not found")
+    if step == "phone":
+        context.user_data["withdraw_phone"] = update.message.text
+        context.user_data["withdraw_step"] = "network"
+        await update.message.reply_text("📶 Enter your network (MTN, Airtel, Glo, 9mobile):")
+    elif step == "network":
+        phone = context.user_data.get("withdraw_phone")
+        network = update.message.text
+        amount = MIN_WITHDRAW
 
-# === Webhook Route ===
-@app.route('/webhook', methods=["POST"])
-def webhook():
-    update = Update.de_json(request.get_json(force=True), bot)
-    dispatcher.process_update(update)
-    return "ok", 200
+        # Save withdrawal
+        ref = db.reference(f"users/{user_id}")
+        user_data = ref.get()
+        withdrawals = user_data.get("withdrawals", [])
+        withdrawals.append({
+            "amount": amount,
+            "phone": phone,
+            "network": network,
+            "status": "pending"
+        })
+        ref.update({
+            "withdrawals": withdrawals,
+            "balance": user_data.get("balance", 0) - amount
+        })
 
-@app.route('/')
+        context.user_data.clear()
+
+        await update.message.reply_text(
+            f"✅ Withdrawal request of ₦{amount} submitted!\n📱 You will receive airtime on {phone} ({network})"
+        )
+
+# Add handlers
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("balance", balance))
+application.add_handler(CommandHandler("refer", refer))
+application.add_handler(CommandHandler("history", history))
+application.add_handler(CommandHandler("withdraw", withdraw))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+# Flask webhook route
+@app.route("/")
 def home():
-    return "🤖 Bot is running", 200
+    return "✅ Airtime Drop Bot is running."
 
-# === Register Handlers ===
-dispatcher.add_handler(CommandHandler("start", start))
-dispatcher.add_handler(CommandHandler("balance", balance))
-dispatcher.add_handler(CommandHandler("refer", refer))
-dispatcher.add_handler(CommandHandler("withdraw", withdraw))
-dispatcher.add_handler(CommandHandler("history", history))
-dispatcher.add_handler(CommandHandler("setbalance", setbalance))
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    application.update_queue.put(update)
+    return "ok"
 
-# Run Flask App
+# Set webhook on startup
+@app.before_first_request
+def set_webhook():
+    webhook_url = f"{WEBHOOK_URL}/webhook"
+    requests.get(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
+        params={"url": webhook_url}
+    )
+
+# Run Flask
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(port=5000)
