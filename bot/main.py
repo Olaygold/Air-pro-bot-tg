@@ -1,3 +1,4 @@
+
 import os
 import json
 import time
@@ -42,7 +43,9 @@ logging.basicConfig(
 logger = logging.getLogger("AirtimeBot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GROUP_USERNAME = os.getenv("GROUP_USERNAME", "").strip()
+# Support CHANNEL_ID / GROUP_USERNAME and CHANNEL_INVITE_LINK / GROUP_LINK
+CHANNEL_ID = os.getenv("CHANNEL_ID") or os.getenv("GROUP_USERNAME", "")
+CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK") or os.getenv("GROUP_LINK") or os.getenv("GROUP_USERNAME", "")
 WHATSAPP_LINK = os.getenv("WHATSAPP_LINK", "").strip()
 FIREBASE_URL = os.getenv("FIREBASE_URL", "").strip()
 IA_CAFE_API_KEY = os.getenv("IA_CAFE_API_KEY", "").strip()
@@ -210,33 +213,26 @@ async def dispatch_airtime_api(phone: str, service_id: str, amount: int, user_id
         return {"code": "failed", "message": str(exc)}
 
 # ──────────────────────────────────────────────
-# STRICT GROUP MEMBERSHIP CHECK
-# ──────────────────────────────────────────────
-
-# ──────────────────────────────────────────────
-# STRICT GROUP MEMBERSHIP CHECK (AUTO-FORMATTED)
+# CHANNEL & GROUP MEMBERSHIP CHECK
 # ──────────────────────────────────────────────
 async def verify_chat_membership(bot: Bot, user_id: int) -> bool:
-    if not GROUP_USERNAME:
+    if not CHANNEL_ID:
         return True
     try:
-        raw = GROUP_USERNAME.strip()
+        raw_id = CHANNEL_ID.strip()
 
-        # Clean URL if user pasted https://t.me/...
-        if "t.me/" in raw:
-            raw = raw.split("t.me/")[-1].replace("+", "").strip("/")
-
-        # Check if numerical chat ID (e.g. -100123456789)
-        if raw.startswith("-") and raw[1:].isdigit():
-            chat_identifier = int(raw)
-        elif raw.isdigit():
-            chat_identifier = int(f"-100{raw}")
+        # Handle numeric ID (e.g. -1002345678901)
+        if raw_id.startswith("-") and raw_id[1:].isdigit():
+            chat_id = int(raw_id)
+        elif raw_id.isdigit():
+            chat_id = int(f"-100{raw_id}")
         else:
-            chat_identifier = raw if raw.startswith("@") else f"@{raw}"
+            # Clean username if provided
+            cleaned = raw_id.replace("https://t.me/", "").replace("t.me/", "").strip("/")
+            chat_id = cleaned if cleaned.startswith("@") else f"@{cleaned}"
 
-        member = await bot.get_chat_member(chat_id=chat_identifier, user_id=user_id)
+        member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
         
-        # Accepted member statuses
         return member.status in [
             ChatMemberStatus.MEMBER,
             ChatMemberStatus.ADMINISTRATOR,
@@ -244,10 +240,18 @@ async def verify_chat_membership(bot: Bot, user_id: int) -> bool:
             ChatMemberStatus.RESTRICTED
         ]
     except Exception as e:
-        logger.warning(f"Strict group check failed for user {user_id} on chat '{GROUP_USERNAME}': {e}")
+        logger.warning(f"Chat check error for user {user_id} on {CHANNEL_ID}: {e}")
         return False
+
+def get_join_link() -> str:
+    link = CHANNEL_INVITE_LINK.strip()
+    if link.startswith("http"):
+        return link
+    clean = link.lstrip("@")
+    return f"https://t.me/{clean}"
+
 # ──────────────────────────────────────────────
-# MAIN UI KEYBOARD
+# UI KEYBOARDS
 # ──────────────────────────────────────────────
 def build_main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -265,8 +269,16 @@ def build_main_keyboard() -> InlineKeyboardMarkup:
         ]
     ])
 
+def build_join_gate_keyboard(ref_code: str = "") -> InlineKeyboardMarkup:
+    join_url = get_join_link()
+    callback_param = f"checkjoin_{ref_code}" if ref_code else "checkjoin_"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Join Official Channel", url=join_url)],
+        [InlineKeyboardButton("✅ I Have Joined", callback_data=callback_param)]
+    ])
+
 # ──────────────────────────────────────────────
-# COMMAND HANDLERS
+# COMMAND & EVENT HANDLERS
 # ──────────────────────────────────────────────
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -276,7 +288,6 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_record = get_user(user_id)
     
-    # Existing user
     if user_record:
         await update.message.reply_text(
             f"👋 Welcome back, *{username}*!\n\nUse the buttons below to navigate:",
@@ -285,25 +296,32 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Strict Group Check
+    # Check Channel Membership
     is_member = await verify_chat_membership(context.bot, user.id)
     if not is_member:
-        group_handle = GROUP_USERNAME.lstrip("@")
-        join_btn = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📢 Join Telegram Group", url=f"https://t.me/{group_handle}")],
-            [InlineKeyboardButton("✅ I Have Joined", url=f"https://t.me/{context.bot.username}?start={ref_code or 'joined'}")]
-        ])
         await update.message.reply_text(
-            f"⚠️ *Membership Verification Required*\n\n"
-            f"You must join our official Telegram group to activate your account!\n\n"
-            f"1. Click the button below to join.\n"
-            f"2. Return and click *'I Have Joined'* to claim your ₦{SIGNUP_BONUS} bonus.",
-            reply_markup=join_btn,
+            f"⚠️ *Channel Verification Required*\n\n"
+            f"You must join our official Telegram channel to activate your account!\n\n"
+            f"1. Click *'Join Official Channel'* below.\n"
+            f"2. After joining, click *'I Have Joined'* to get your ₦{SIGNUP_BONUS} bonus.",
+            reply_markup=build_join_gate_keyboard(ref_code or ""),
             parse_mode="Markdown"
         )
         return
 
-    # Give Random Referral Bonus (₦30 - ₦50, mostly ₦35) to Referrer
+    # Register user directly if already a member
+    register_new_user(user_id, username, ref_code, context)
+    await update.message.reply_text(
+        f"🎊 *Registration Complete!*\n\n"
+        f"Welcome, *{username}*! You received your ₦{SIGNUP_BONUS} welcome bonus.\n\n"
+        f"📱 *WhatsApp Channel:* {WHATSAPP_LINK}\n\n"
+        f"Choose an option below to start earning:",
+        reply_markup=build_main_keyboard(),
+        parse_mode="Markdown"
+    )
+
+def register_new_user(user_id: str, username: str, ref_code: str, context: ContextTypes.DEFAULT_TYPE):
+    # Referral Reward Logic
     if ref_code and ref_code != user_id:
         referrer_data = get_user(ref_code)
         if referrer_data and user_id not in referrer_data.get("referrals", []):
@@ -318,17 +336,16 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             })
             
             try:
-                await context.bot.send_message(
+                context.application.create_task(context.bot.send_message(
                     chat_id=int(ref_code),
                     text=f"🎉 *New Referral Joined!*\n\n"
                          f"🎁 Reward Earned: *₦{awarded_bonus}*\n"
                          f"💰 Total Balance: *₦{new_ref_balance:,}*",
                     parse_mode="Markdown"
-                )
+                ))
             except Exception:
                 pass
 
-    # Create New User Profile
     new_profile = {
         "id": user_id,
         "username": username,
@@ -342,11 +359,33 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     save_user(user_id, new_profile)
 
-    await update.message.reply_text(
-        f"🎊 *Registration Complete!*\n\n"
-        f"Welcome, *{username}*! You received your ₦{SIGNUP_BONUS} welcome bonus.\n\n"
+# Handle "✅ I Have Joined" Callback Button
+async def handle_check_joined_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+    user_id = str(user.id)
+    username = user.first_name or "Participant"
+
+    # Extract referral code from callback data
+    data = query.data or ""
+    ref_code = data.replace("checkjoin_", "").strip()
+
+    is_member = await verify_chat_membership(context.bot, user.id)
+    if not is_member:
+        await query.answer("❌ You have not joined the channel yet! Please join first.", show_alert=True)
+        return
+
+    await query.answer("✅ Membership verified!")
+
+    user_record = get_user(user_id)
+    if not user_record:
+        register_new_user(user_id, username, ref_code, context)
+
+    await query.edit_message_text(
+        f"🎊 *Verification Successful!*\n\n"
+        f"Welcome, *{username}*! You have received your ₦{SIGNUP_BONUS} bonus.\n\n"
         f"📱 *WhatsApp Channel:* {WHATSAPP_LINK}\n\n"
-        f"Choose an option below to start earning:",
+        f"Use the dashboard below:",
         reply_markup=build_main_keyboard(),
         parse_mode="Markdown"
     )
@@ -561,7 +600,7 @@ async def conv_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return CASH_AMOUNT
 
-# ── Airtime Sub-flow ──
+# ── Airtime Flow ──
 async def conv_airtime_phone_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_phone = update.message.text.strip()
     valid_phone = validate_nigerian_phone(raw_phone)
@@ -640,7 +679,6 @@ async def conv_airtime_confirm_step(update: Update, context: ContextTypes.DEFAUL
     carrier = context.user_data.get("service_id")
     amount = context.user_data.get("amount")
 
-    # Double check balance to prevent race conditions
     user_data = get_user(user_id)
     current_balance = user_data.get("balance", 0)
     if amount > current_balance:
@@ -648,7 +686,6 @@ async def conv_airtime_confirm_step(update: Update, context: ContextTypes.DEFAUL
         context.user_data.clear()
         return ConversationHandler.END
 
-    # Deduct balance
     new_bal = current_balance - amount
     history_entry = {
         "type": "airtime",
@@ -664,7 +701,6 @@ async def conv_airtime_confirm_step(update: Update, context: ContextTypes.DEFAUL
 
     await query.edit_message_text("⚙️ Contacting IA-Café Gateway... Please wait.")
 
-    # Call IA-Café API
     api_result = await dispatch_airtime_api(phone, carrier, amount, user_id)
 
     if api_result.get("code") == "success":
@@ -682,7 +718,6 @@ async def conv_airtime_confirm_step(update: Update, context: ContextTypes.DEFAUL
             reply_markup=build_main_keyboard()
         )
     else:
-        # Automatic Refund
         error_detail = api_result.get("message", "API Gateway Error")
         if isinstance(api_result.get("error"), dict):
             error_detail = api_result["error"].get("message", error_detail)
@@ -704,7 +739,7 @@ async def conv_airtime_confirm_step(update: Update, context: ContextTypes.DEFAUL
     context.user_data.clear()
     return ConversationHandler.END
 
-# ── Cash Sub-flow ──
+# ── Cash Flow ──
 async def conv_cash_amount_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         amount = int(re.sub(r"[^\d]", "", update.message.text.strip()))
@@ -775,7 +810,7 @@ async def conv_cash_name_step(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"🏦 *Bank:* {bank}\n"
         f"🔢 *Account:* `{account}`\n"
         f"👤 *Name:* {acc_name}\n\n"
-        f"⚠️ Cash payouts will be processed by the admin.",
+        f"⚠️ Cash payouts will be reviewed and processed by admin.",
         reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="Markdown"
     )
@@ -832,7 +867,7 @@ async def conv_cash_confirm_step(update: Update, context: ContextTypes.DEFAULT_T
         "date": datetime.now().isoformat()
     })
 
-    # Alert all authenticated admins
+    # Notify all admins
     all_users = get_all_users()
     for uid, udata in all_users.items():
         if udata.get("is_admin"):
@@ -1056,7 +1091,7 @@ async def handle_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.message.reply_text("💸 Type /withdraw to initiate withdrawal.")
 
 # ──────────────────────────────────────────────
-# MAIN RUNNER
+# MAIN ENTRYPOINT
 # ──────────────────────────────────────────────
 def main():
     if not BOT_TOKEN:
@@ -1091,6 +1126,8 @@ def main():
         conversation_timeout=300
     )
 
+    # Register Handlers
+    app.add_handler(CallbackQueryHandler(handle_check_joined_callback, pattern="^checkjoin_"))
     app.add_handler(withdraw_dialog)
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("balance", handle_balance))
