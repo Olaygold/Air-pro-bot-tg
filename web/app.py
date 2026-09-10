@@ -1,8 +1,10 @@
 
 import os
 import sys
+import io
 import json
 import logging
+import asyncio
 import threading
 import subprocess
 import requests
@@ -10,7 +12,6 @@ from flask import Flask, render_template, request, redirect, session
 import firebase_admin
 from firebase_admin import credentials, db
 from dotenv import load_dotenv
-from a2wsgi import WSGIMiddleware
 
 # ──────────────────────────────────────────────
 # CONFIG & LOGGING
@@ -56,17 +57,17 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
 # ──────────────────────────────────────────────
-# BACKGROUND BOT PROCESS STARTER
+# BACKGROUND TELEGRAM BOT LAUNCHER
 # ──────────────────────────────────────────────
 def start_bot_process():
-    """Runs bot/main.py in the background alongside this web panel on Render."""
+    """Starts bot/main.py in the background alongside this web panel on Render."""
     try:
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        # Look for bot/main.py in parent directory or same directory
         bot_paths = [
             os.path.join(current_dir, "..", "bot", "main.py"),
             os.path.join(current_dir, "bot", "main.py"),
-            os.path.join(current_dir, "main.py")
+            os.path.join(current_dir, "main.py"),
+            os.path.abspath("bot/main.py")
         ]
         
         bot_script = None
@@ -76,10 +77,10 @@ def start_bot_process():
                 break
 
         if bot_script:
-            logger.info(f"🤖 Launching Telegram Bot process from: {bot_script}")
+            logger.info(f"🤖 Launching Telegram Bot from: {bot_script}")
             subprocess.Popen([sys.executable, bot_script])
         else:
-            logger.warning("⚠️ bot/main.py path not found. Please ensure bot folder exists.")
+            logger.warning("⚠️ bot/main.py not found. Ensure the 'bot' folder exists.")
     except Exception as e:
         logger.error(f"❌ Failed to spawn Telegram bot process: {e}")
 
@@ -87,7 +88,7 @@ def start_bot_process():
 threading.Thread(target=start_bot_process, daemon=True).start()
 
 # ──────────────────────────────────────────────
-# TELEGRAM NOTIFIER HELPER
+# TELEGRAM NOTIFIER
 # ──────────────────────────────────────────────
 def notify_user(chat_id, text):
     if not chat_id:
@@ -102,7 +103,7 @@ def notify_user(chat_id, text):
         logger.error(f"Failed to notify user {chat_id}: {e}")
 
 # ──────────────────────────────────────────────
-# WEB ROUTES
+# ROUTES
 # ──────────────────────────────────────────────
 @flask_app.route("/", methods=["GET", "POST"])
 def login():
@@ -120,11 +121,9 @@ def dashboard():
     if not session.get("admin"):
         return redirect("/")
     
-    # Read both pending and old format withdrawals
     pending_withdrawals = db.reference("pending_withdrawals").get() or {}
     legacy_withdrawals = db.reference("withdrawals").get() or {}
     
-    # Merge for rendering
     all_withdrawals = {**legacy_withdrawals, **pending_withdrawals}
     return render_template("dashboard.html", withdrawals=all_withdrawals)
 
@@ -133,7 +132,6 @@ def mark_paid(withdrawal_id):
     if not session.get("admin"):
         return redirect("/")
 
-    # Check pending_withdrawals first, fallback to withdrawals
     ref_pending = db.reference(f"pending_withdrawals/{withdrawal_id}")
     ref_legacy = db.reference(f"withdrawals/{withdrawal_id}")
     
@@ -145,13 +143,11 @@ def mark_paid(withdrawal_id):
         bank = data.get("bank", "Bank")
         account = data.get("account", "")
 
-        # Update in pending/legacy tables
         if ref_pending.get():
             ref_pending.delete()
         if ref_legacy.get():
             ref_legacy.update({"status": "Paid"})
 
-        # Update user's personal withdrawal log
         if user_id:
             user_data = db.reference(f"users/{user_id}").get() or {}
             withdrawals = user_data.get("withdrawals", [])
@@ -161,7 +157,6 @@ def mark_paid(withdrawal_id):
                     break
             db.reference(f"users/{user_id}").update({"withdrawals": withdrawals})
 
-            # Notify user on Telegram
             notify_user(
                 user_id,
                 f"🎉 *Cash Withdrawal Approved & Paid!*\n\n"
@@ -186,13 +181,11 @@ def reject_withdrawal(withdrawal_id):
         user_id = data.get("user_id") or data.get("telegram_id")
         amount = data.get("amount", 0)
 
-        # Delete from pending
         if ref_pending.get():
             ref_pending.delete()
         if ref_legacy.get():
             ref_legacy.update({"status": "Rejected"})
 
-        # Refund user wallet
         if user_id:
             user_data = db.reference(f"users/{user_id}").get() or {}
             current_bal = user_data.get("balance", 0)
@@ -223,10 +216,91 @@ def logout():
     return redirect("/")
 
 # ──────────────────────────────────────────────
-# ASGI EXPORT FOR UVICORN
+# ZERO-DEPENDENCY NATIVE ASGI WRAPPER FOR UVICORN
 # ──────────────────────────────────────────────
-# Wrap Flask WSGI app so uvicorn runs it directly without errors:
-app = WSGIMiddleware(flask_app)
+class BuiltinASGIWrapper:
+    """Wraps Flask WSGI into ASGI directly so uvicorn runs it without any extra libraries."""
+    def __init__(self, wsgi_application):
+        self.wsgi_app = wsgi_application
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "lifespan":
+            while True:
+                message = await receive()
+                if message["type"] == "lifespan.startup":
+                    await send({"type": "lifespan.startup.complete"})
+                elif message["type"] == "lifespan.shutdown":
+                    await send({"type": "lifespan.shutdown.complete"})
+                    return
+
+        if scope["type"] != "http":
+            return
+
+        body = b""
+        while True:
+            message = await receive()
+            body += message.get("body", b"")
+            if not message.get("more_body", False):
+                break
+
+        environ = {
+            "REQUEST_METHOD": scope["method"],
+            "SCRIPT_NAME": "",
+            "PATH_INFO": scope["path"],
+            "QUERY_STRING": scope.get("query_string", b"").decode("latin1"),
+            "SERVER_NAME": scope.get("server", ("127.0.0.1", 80))[0],
+            "SERVER_PORT": str(scope.get("server", ("127.0.0.1", 80))[1]),
+            "SERVER_PROTOCOL": f"HTTP/{scope.get('http_version', '1.1')}",
+            "wsgi.version": (1, 0),
+            "wsgi.url_scheme": scope.get("scheme", "http"),
+            "wsgi.input": io.BytesIO(body),
+            "wsgi.errors": sys.stderr,
+            "wsgi.multithread": True,
+            "wsgi.multiprocess": False,
+            "wsgi.run_once": False,
+        }
+
+        for header_name, header_val in scope.get("headers", []):
+            name = header_name.decode("latin1").upper().replace("-", "_")
+            val = header_val.decode("latin1")
+            if name == "CONTENT_TYPE":
+                environ["CONTENT_TYPE"] = val
+            elif name == "CONTENT_LENGTH":
+                environ["CONTENT_LENGTH"] = val
+            else:
+                environ[f"HTTP_{name}"] = val
+
+        status_code = 200
+        response_headers = []
+
+        def start_response(status_str, headers_list, exc_info=None):
+            nonlocal status_code, response_headers
+            status_code = int(status_str.split(" ", 1)[0])
+            response_headers = [
+                (k.lower().encode("latin1"), v.encode("latin1"))
+                for k, v in headers_list
+            ]
+
+        def run_wsgi_sync():
+            return list(self.wsgi_app(environ, start_response))
+
+        response_chunks = await asyncio.to_thread(run_wsgi_sync)
+
+        await send({
+            "type": "http.response.start",
+            "status": status_code,
+            "headers": response_headers,
+        })
+
+        for chunk in response_chunks:
+            await send({
+                "type": "http.response.body",
+                "body": chunk,
+                "more_body": False,
+            })
+
+# Export the ASGI application for uvicorn
+app = BuiltinASGIWrapper(flask_app)
 
 if __name__ == "__main__":
     flask_app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
