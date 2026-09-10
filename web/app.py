@@ -1,4 +1,3 @@
-
 import os
 import sys
 import io
@@ -219,7 +218,7 @@ def logout():
 # ZERO-DEPENDENCY NATIVE ASGI WRAPPER FOR UVICORN
 # ──────────────────────────────────────────────
 class BuiltinASGIWrapper:
-    """Wraps Flask WSGI into ASGI directly so uvicorn runs it without any extra libraries."""
+    """Wraps Flask WSGI into ASGI directly so uvicorn runs it cleanly."""
     def __init__(self, wsgi_application):
         self.wsgi_app = wsgi_application
 
@@ -285,6 +284,7 @@ class BuiltinASGIWrapper:
             return list(self.wsgi_app(environ, start_response))
 
         response_chunks = await asyncio.to_thread(run_wsgi_sync)
+        full_body = b"".join(response_chunks)
 
         await send({
             "type": "http.response.start",
@@ -292,12 +292,11 @@ class BuiltinASGIWrapper:
             "headers": response_headers,
         })
 
-        for chunk in response_chunks:
-            await send({
-                "type": "http.response.body",
-                "body": chunk,
-                "more_body": False,
-            })
+        await send({
+            "type": "http.response.body",
+            "body": full_body,
+            "more_body": False,
+        })
 
 # Export the ASGI application for uvicorn
 app = BuiltinASGIWrapper(flask_app)
