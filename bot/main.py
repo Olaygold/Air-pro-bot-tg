@@ -212,21 +212,40 @@ async def dispatch_airtime_api(phone: str, service_id: str, amount: int, user_id
 # ──────────────────────────────────────────────
 # STRICT GROUP MEMBERSHIP CHECK
 # ──────────────────────────────────────────────
+
+# ──────────────────────────────────────────────
+# STRICT GROUP MEMBERSHIP CHECK (AUTO-FORMATTED)
+# ──────────────────────────────────────────────
 async def verify_chat_membership(bot: Bot, user_id: int) -> bool:
     if not GROUP_USERNAME:
         return True
     try:
-        chat_identifier = GROUP_USERNAME if GROUP_USERNAME.startswith("@") else f"@{GROUP_USERNAME}"
+        raw = GROUP_USERNAME.strip()
+
+        # Clean URL if user pasted https://t.me/...
+        if "t.me/" in raw:
+            raw = raw.split("t.me/")[-1].replace("+", "").strip("/")
+
+        # Check if numerical chat ID (e.g. -100123456789)
+        if raw.startswith("-") and raw[1:].isdigit():
+            chat_identifier = int(raw)
+        elif raw.isdigit():
+            chat_identifier = int(f"-100{raw}")
+        else:
+            chat_identifier = raw if raw.startswith("@") else f"@{raw}"
+
         member = await bot.get_chat_member(chat_id=chat_identifier, user_id=user_id)
+        
+        # Accepted member statuses
         return member.status in [
             ChatMemberStatus.MEMBER,
             ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER
+            ChatMemberStatus.OWNER,
+            ChatMemberStatus.RESTRICTED
         ]
     except Exception as e:
-        logger.warning(f"Strict group membership check rejected user {user_id}: {e}")
+        logger.warning(f"Strict group check failed for user {user_id} on chat '{GROUP_USERNAME}': {e}")
         return False
-
 # ──────────────────────────────────────────────
 # MAIN UI KEYBOARD
 # ──────────────────────────────────────────────
