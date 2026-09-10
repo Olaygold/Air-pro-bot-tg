@@ -1,297 +1,316 @@
-
 import os
 import json
 import time
 import random
 import logging
-import asyncio
 import re
 import uuid
-import requests
+import httpx
 from datetime import datetime, timedelta
-from flask import Flask, request, jsonify
+
 from dotenv import load_dotenv
-from firebase_admin import credentials, initialize_app, db
-from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+import firebase_admin
+from firebase_admin import credentials, db
+
+from telegram import (
+    Update,
+    Bot,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup
+)
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters, ConversationHandler, AIORateLimiter
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+    ConversationHandler,
+    AIORateLimiter
 )
 from telegram.constants import ChatMemberStatus
 
 # ──────────────────────────────────────────────
-# CONFIG & ENV
+# CONFIG & LOGGING
 # ──────────────────────────────────────────────
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-GROUP_USERNAME = os.getenv("GROUP_USERNAME", "@your_group")
-WHATSAPP_LINK = os.getenv("WHATSAPP_LINK", "")
-FIREBASE_URL = os.getenv("FIREBASE_URL")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-IA_CAFE_API_KEY = os.getenv("IA_CAFE_API_KEY")
-ADMIN_CODES = [c.strip() for c in os.getenv("ADMIN_CODES", "").split(",") if c.strip()]
-
-# ──────────────────────────────────────────────
-# LOGGING
-# ──────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("AirtimeBot")
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROUP_USERNAME = os.getenv("GROUP_USERNAME", "").strip()
+WHATSAPP_LINK = os.getenv("WHATSAPP_LINK", "").strip()
+FIREBASE_URL = os.getenv("FIREBASE_URL", "").strip()
+IA_CAFE_API_KEY = os.getenv("IA_CAFE_API_KEY", "").strip()
+ADMIN_CODES = [c.strip() for c in os.getenv("ADMIN_CODES", "").split(",") if c.strip()]
 
 # ──────────────────────────────────────────────
-# FIREBASE SETUP
+# FIREBASE INITIALIZATION
 # ──────────────────────────────────────────────
-try:
-    firebase_raw = os.getenv("FIREBASE_CREDENTIALS", "{}")
-    firebase_clean = firebase_raw.encode().decode("unicode_escape")
-    cred_data = json.loads(firebase_clean)
-    cred = credentials.Certificate(cred_data)
-    initialize_app(cred, {"databaseURL": FIREBASE_URL})
-    logger.info("✅ Firebase initialized")
-except Exception as e:
-    logger.error(f"❌ Firebase init failed: {e}")
+if not firebase_admin._apps:
+    try:
+        firebase_raw = os.getenv("FIREBASE_CREDENTIALS", "{}")
+        firebase_clean = firebase_raw.encode().decode("unicode_escape")
+        cred_data = json.loads(firebase_clean)
+        cred = credentials.Certificate(cred_data)
+        firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_URL})
+        logger.info("✅ Firebase Database connected.")
+    except Exception as e:
+        logger.error(f"❌ Firebase init failed: {e}")
 
 # ──────────────────────────────────────────────
-# CONSTANTS
+# CONSTANTS & REWARD RULES
 # ──────────────────────────────────────────────
 SIGNUP_BONUS = 50
 DAILY_BONUS = 10
 MIN_WITHDRAW_AIRTIME = 350
 DAILY_COOLDOWN_HOURS = 24
 
-# Referral bonus weights: mostly 35, rarely 50
-REFERRAL_BONUS_OPTIONS = [30, 35, 35, 35, 35, 35, 35, 40, 40, 45, 50]
+# Weighted referral pool: 30-50, majority receiving 35
+REFERRAL_BONUS_POOL = [30, 35, 35, 35, 35, 35, 35, 40, 40, 45, 50]
 
-# Withdrawal tiers
-WITHDRAWAL_TIERS = {
-    100: {"max_cash": 25000, "label": "💎 Diamond (100+ refs)"},
-    50:  {"max_cash": 10000, "label": "🥇 Gold (50+ refs)"},
-    0:   {"max_cash": 0,     "label": "🥉 Bronze (<50 refs, airtime only)"},
-}
-
-# Network prefix mapping (from IA-Café docs)
+# Network definitions & IA-Café Service IDs
 NETWORK_PREFIXES = {
-    "mtn":     ["0703","0706","0803","0806","0810","0813","0814","0816","0903","0906","0913"],
-    "airtel":  ["0701","0708","0802","0808","0812","0902","0907","0901","0912"],
-    "glo":     ["0705","0805","0807","0811","0815","0905","0915"],
-    "9mobile": ["0809","0817","0818","0908","0909"],
+    "mtn": ["0703", "0706", "0803", "0806", "0810", "0813", "0814", "0816", "0903", "0906", "0913"],
+    "airtel": ["0701", "0708", "0802", "0808", "0812", "0902", "0907", "0901", "0912"],
+    "glo": ["0705", "0805", "0807", "0811", "0815", "0905", "0915"],
+    "9mobile": ["0809", "0817", "0818", "0908", "0909"],
 }
 
-NETWORK_DISPLAY = {"mtn": "MTN", "airtel": "Airtel", "glo": "Glo", "9mobile": "9mobile"}
-NETWORK_MIN_AMOUNT = {"mtn": 10, "airtel": 50, "glo": 50, "9mobile": 50}
+NETWORK_NAMES = {
+    "mtn": "MTN",
+    "airtel": "Airtel",
+    "glo": "Glo",
+    "9mobile": "9mobile"
+}
+
+NETWORK_MIN = {
+    "mtn": 10,
+    "airtel": 50,
+    "glo": 50,
+    "9mobile": 50
+}
+
+# Conversation States
+(
+    CHOOSING_TYPE,
+    AIRTIME_PHONE,
+    AIRTIME_AMOUNT,
+    CONFIRM_AIRTIME,
+    CASH_AMOUNT,
+    CASH_BANK,
+    CASH_ACCOUNT,
+    CASH_NAME,
+    CONFIRM_CASH
+) = range(9)
 
 # ──────────────────────────────────────────────
-# CONVERSATION STATES
-# ──────────────────────────────────────────────
-CHOOSING_TYPE, AIRTIME_PHONE, AIRTIME_AMOUNT, CONFIRM_AIRTIME = range(4)
-CASH_AMOUNT, CASH_BANK, CASH_ACCOUNT, CASH_NAME, CONFIRM_CASH = range(4, 9)
-
-# ──────────────────────────────────────────────
-# FLASK APP
-# ──────────────────────────────────────────────
-app = Flask(__name__)
-
-# ──────────────────────────────────────────────
-# TELEGRAM APPLICATION
-# ──────────────────────────────────────────────
-application = (
-    Application.builder()
-    .token(BOT_TOKEN)
-    .rate_limiter(AIORateLimiter())
-    .build()
-)
-
-# ──────────────────────────────────────────────
-# FIREBASE HELPERS
+# DATABASE ACCESS HELPERS
 # ──────────────────────────────────────────────
 def get_user(user_id: str) -> dict:
     try:
         return db.reference(f"users/{user_id}").get() or {}
     except Exception as e:
-        logger.error(f"Firebase read error for {user_id}: {e}")
+        logger.error(f"Error reading user {user_id}: {e}")
         return {}
 
 def save_user(user_id: str, data: dict):
     try:
         db.reference(f"users/{user_id}").update(data)
     except Exception as e:
-        logger.error(f"Firebase write error for {user_id}: {e}")
+        logger.error(f"Error saving user {user_id}: {e}")
 
 def get_all_users() -> dict:
     try:
         return db.reference("users").get() or {}
     except Exception as e:
-        logger.error(f"Firebase read all error: {e}")
+        logger.error(f"Error reading all users: {e}")
         return {}
+
+def save_pending_withdrawal(req_id: str, data: dict):
+    try:
+        db.reference(f"pending_withdrawals/{req_id}").set(data)
+    except Exception as e:
+        logger.error(f"Error saving pending withdrawal: {e}")
 
 def get_pending_withdrawals() -> dict:
     try:
         return db.reference("pending_withdrawals").get() or {}
     except Exception as e:
-        logger.error(f"Firebase pending read error: {e}")
+        logger.error(f"Error fetching pending withdrawals: {e}")
         return {}
 
-def save_pending_withdrawal(w_id: str, data: dict):
+def delete_pending_withdrawal(req_id: str):
     try:
-        db.reference(f"pending_withdrawals/{w_id}").set(data)
+        db.reference(f"pending_withdrawals/{req_id}").delete()
     except Exception as e:
-        logger.error(f"Firebase pending write error: {e}")
-
-def delete_pending_withdrawal(w_id: str):
-    try:
-        db.reference(f"pending_withdrawals/{w_id}").delete()
-    except Exception as e:
-        logger.error(f"Firebase pending delete error: {e}")
-
-def is_admin(user_id: str) -> bool:
-    user = get_user(user_id)
-    return user.get("is_admin", False)
+        logger.error(f"Error deleting pending withdrawal {req_id}: {e}")
 
 # ──────────────────────────────────────────────
-# VALIDATION HELPERS
+# VALIDATION & UTILITIES
 # ──────────────────────────────────────────────
-def validate_phone(phone: str) -> str | None:
-    """Validate Nigerian phone number, return normalized 11-digit or None."""
-    phone = re.sub(r"[^\d]", "", phone)
-    if phone.startswith("234") and len(phone) == 13:
-        phone = "0" + phone[3:]
-    elif phone.startswith("+234") and len(phone) == 14:
-        phone = "0" + phone[4:]
-    if len(phone) == 11 and phone.startswith("0"):
-        return phone
+def validate_nigerian_phone(phone_str: str) -> str | None:
+    digits = re.sub(r"[^\d]", "", phone_str)
+    if digits.startswith("234") and len(digits) == 13:
+        digits = "0" + digits[3:]
+    elif digits.startswith("+234") and len(digits) == 14:
+        digits = "0" + digits[4:]
+
+    if len(digits) == 11 and digits.startswith("0"):
+        return digits
     return None
 
-def detect_network(phone: str) -> str | None:
-    """Auto-detect network from phone prefix."""
-    prefix = phone[:4]
-    for network, prefixes in NETWORK_PREFIXES.items():
+def detect_carrier(phone_11: str) -> str | None:
+    prefix = phone_11[:4]
+    for carrier, prefixes in NETWORK_PREFIXES.items():
         if prefix in prefixes:
-            return network
+            return carrier
     return None
 
 def get_user_tier(referral_count: int) -> dict:
-    """Get withdrawal tier based on referral count."""
     if referral_count >= 100:
-        return WITHDRAWAL_TIERS[100]
+        return {"max_cash": 25000, "label": "💎 Diamond VIP (100+ Referrals)", "cash_eligible": True}
     elif referral_count >= 50:
-        return WITHDRAWAL_TIERS[50]
+        return {"max_cash": 10000, "label": "🥇 Gold Tier (50+ Referrals)", "cash_eligible": True}
     else:
-        return WITHDRAWAL_TIERS[0]
-
-def generate_request_id(user_id: str, network: str) -> str:
-    """Generate unique request ID for IA-Café API."""
-    ts = int(time.time())
-    rand = uuid.uuid4().hex[:6]
-    return f"air_{network}_{ts}_{user_id}_{rand}"
+        return {"max_cash": 0, "label": "🥉 Bronze Member (<50 Referrals)", "cash_eligible": False}
 
 # ──────────────────────────────────────────────
 # IA-CAFÉ AIRTIME API
 # ──────────────────────────────────────────────
-def purchase_airtime(phone: str, network: str, amount: int, user_id: str) -> dict:
-    """Call IA-Café API to purchase airtime."""
+async def dispatch_airtime_api(phone: str, service_id: str, amount: int, user_id: str) -> dict:
     url = "https://iacafe.com.ng/devapi/v1/airtime"
+    request_id = f"air_{service_id}_{int(time.time())}_{user_id}_{uuid.uuid4().hex[:5]}"
+    
     headers = {
         "Authorization": f"Bearer {IA_CAFE_API_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "Accept": "application/json"
     }
+    
     payload = {
-        "request_id": generate_request_id(user_id, network),
+        "request_id": request_id,
         "phone": phone,
-        "service_id": network,
+        "service_id": service_id,
         "amount": amount
     }
 
     try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=30)
-        data = resp.json()
-        logger.info(f"IA-Café response: {data}")
-        return data
-    except Exception as e:
-        logger.error(f"IA-Café API error: {e}")
-        return {"code": "error", "message": str(e)}
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            data = resp.json()
+            logger.info(f"IA-Café API Response [{resp.status_code}]: {data}")
+            return data
+    except Exception as exc:
+        logger.error(f"IA-Café Gateway Exception: {exc}")
+        return {"code": "failed", "message": str(exc)}
 
 # ──────────────────────────────────────────────
-# GROUP JOIN CHECK (STRICT)
+# STRICT GROUP MEMBERSHIP CHECK
 # ──────────────────────────────────────────────
-async def has_joined_group(bot: Bot, user_id: int) -> bool:
+async def verify_chat_membership(bot: Bot, user_id: int) -> bool:
+    if not GROUP_USERNAME:
+        return True
     try:
-        member = await bot.get_chat_member(chat_id=GROUP_USERNAME, user_id=user_id)
+        chat_identifier = GROUP_USERNAME if GROUP_USERNAME.startswith("@") else f"@{GROUP_USERNAME}"
+        member = await bot.get_chat_member(chat_id=chat_identifier, user_id=user_id)
         return member.status in [
             ChatMemberStatus.MEMBER,
             ChatMemberStatus.ADMINISTRATOR,
             ChatMemberStatus.OWNER
         ]
     except Exception as e:
-        logger.warning(f"Group check failed for {user_id}: {e}")
-        return False  # STRICT: no bypass
+        logger.warning(f"Strict group membership check rejected user {user_id}: {e}")
+        return False
 
 # ──────────────────────────────────────────────
-# MAIN MENU KEYBOARD
+# MAIN UI KEYBOARD
 # ──────────────────────────────────────────────
-def main_menu_keyboard() -> InlineKeyboardMarkup:
+def build_main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💰 Balance", callback_data="menu_balance"),
-         InlineKeyboardButton("🔗 Refer", callback_data="menu_refer")],
-        [InlineKeyboardButton("💸 Withdraw", callback_data="menu_withdraw"),
-         InlineKeyboardButton("📅 Daily Bonus", callback_data="menu_daily")],
-        [InlineKeyboardButton("📜 History", callback_data="menu_history"),
-         InlineKeyboardButton("❓ Help", callback_data="menu_help")],
+        [
+            InlineKeyboardButton("💰 Balance", callback_data="btn_balance"),
+            InlineKeyboardButton("🔗 Referral Link", callback_data="btn_refer")
+        ],
+        [
+            InlineKeyboardButton("💸 Withdraw", callback_data="btn_withdraw"),
+            InlineKeyboardButton("🎁 Daily Check-in", callback_data="btn_daily")
+        ],
+        [
+            InlineKeyboardButton("📜 History", callback_data="btn_history"),
+            InlineKeyboardButton("ℹ️ Rules & Help", callback_data="btn_help")
+        ]
     ])
 
 # ──────────────────────────────────────────────
-# COMMAND: /start
+# COMMAND HANDLERS
 # ──────────────────────────────────────────────
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = str(user.id)
-    username = user.first_name or "User"
+    username = user.first_name or "Participant"
     ref_code = context.args[0] if context.args else None
 
-    user_data = get_user(user_id)
-    if user_data:
+    user_record = get_user(user_id)
+    
+    # Existing user
+    if user_record:
         await update.message.reply_text(
-            f"👋 Welcome back, {username}!\nUse the menu below:",
-            reply_markup=main_menu_keyboard()
+            f"👋 Welcome back, *{username}*!\n\nUse the buttons below to navigate:",
+            reply_markup=build_main_keyboard(),
+            parse_mode="Markdown"
         )
         return
 
-    # Check group membership
-    joined = await has_joined_group(context.bot, user.id)
-    if not joined:
+    # Strict Group Check
+    is_member = await verify_chat_membership(context.bot, user.id)
+    if not is_member:
+        group_handle = GROUP_USERNAME.lstrip("@")
+        join_btn = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Join Telegram Group", url=f"https://t.me/{group_handle}")],
+            [InlineKeyboardButton("✅ I Have Joined", url=f"https://t.me/{context.bot.username}?start={ref_code or 'joined'}")]
+        ])
         await update.message.reply_text(
-            f"⚠️ You must join our Telegram group first!\n\n"
-            f"👉 Join: https://t.me/{GROUP_USERNAME.lstrip('@')}\n\n"
-            f"Then come back and type /start again."
+            f"⚠️ *Membership Verification Required*\n\n"
+            f"You must join our official Telegram group to activate your account!\n\n"
+            f"1. Click the button below to join.\n"
+            f"2. Return and click *'I Have Joined'* to claim your ₦{SIGNUP_BONUS} bonus.",
+            reply_markup=join_btn,
+            parse_mode="Markdown"
         )
         return
 
-    # Calculate random referral bonus for the referrer
+    # Give Random Referral Bonus (₦30 - ₦50, mostly ₦35) to Referrer
     if ref_code and ref_code != user_id:
-        ref_user = get_user(ref_code)
-        if ref_user and user_id not in ref_user.get("referrals", []):
-            bonus = random.choice(REFERRAL_BONUS_OPTIONS)
-            new_balance = ref_user.get("balance", 0) + bonus
-            referrals = ref_user.get("referrals", [])
-            referrals.append(user_id)
+        referrer_data = get_user(ref_code)
+        if referrer_data and user_id not in referrer_data.get("referrals", []):
+            awarded_bonus = random.choice(REFERRAL_BONUS_POOL)
+            ref_list = referrer_data.get("referrals", [])
+            ref_list.append(user_id)
+            new_ref_balance = referrer_data.get("balance", 0) + awarded_bonus
+            
             save_user(ref_code, {
-                "balance": new_balance,
-                "referrals": referrals
+                "balance": new_ref_balance,
+                "referrals": ref_list
             })
-            # Notify referrer
+            
             try:
                 await context.bot.send_message(
                     chat_id=int(ref_code),
-                    text=f"🎉 You earned ₦{bonus} referral bonus!\n"
-                         f"New balance: ₦{new_balance}"
+                    text=f"🎉 *New Referral Joined!*\n\n"
+                         f"🎁 Reward Earned: *₦{awarded_bonus}*\n"
+                         f"💰 Total Balance: *₦{new_ref_balance:,}*",
+                    parse_mode="Markdown"
                 )
             except Exception:
-                pass  # Referrer may have blocked bot
+                pass
 
-    # Save new user
-    save_user(user_id, {
+    # Create New User Profile
+    new_profile = {
         "id": user_id,
         "username": username,
         "balance": SIGNUP_BONUS,
@@ -300,107 +319,104 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ref_by": ref_code or "",
         "last_checkin": "",
         "is_admin": False,
-        "created_at": datetime.now().isoformat()
-    })
+        "joined_date": datetime.now().isoformat()
+    }
+    save_user(user_id, new_profile)
 
     await update.message.reply_text(
-        f"🎉 Welcome {username}!\n\n"
-        f"✅ You've received ₦{SIGNUP_BONUS} signup bonus!\n\n"
-        f"👥 Join our groups:\n"
-        f"📱 Telegram: https://t.me/{GROUP_USERNAME.lstrip('@')}\n"
-        f"💬 WhatsApp: {WHATSAPP_LINK}\n\n"
-        f"Use the menu below to get started 👇",
-        reply_markup=main_menu_keyboard()
+        f"🎊 *Registration Complete!*\n\n"
+        f"Welcome, *{username}*! You received your ₦{SIGNUP_BONUS} welcome bonus.\n\n"
+        f"📱 *WhatsApp Channel:* {WHATSAPP_LINK}\n\n"
+        f"Choose an option below to start earning:",
+        reply_markup=build_main_keyboard(),
+        parse_mode="Markdown"
     )
 
-# ──────────────────────────────────────────────
-# COMMAND: /help
-# ──────────────────────────────────────────────
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "📖 *HOW TO USE THIS BOT*\n\n"
-        "🔹 /start — Register & main menu\n"
-        "🔹 /balance — Check your balance\n"
-        "🔹 /refer — Get your referral link\n"
-        "🔹 /daily — Claim ₦10 daily bonus\n"
-        "🔹 /withdraw — Withdraw airtime or cash\n"
-        "🔹 /history — View transaction history\n\n"
+async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_message = (
+        "📖 *AIRTIME & CASH DROP RULES*\n\n"
+        "1. *Daily Bonus:* Claim ₦10 every 24 hours via /daily.\n"
+        "2. *Referrals:* Earn ₦30 - ₦50 randomly per active friend.\n\n"
         "💸 *WITHDRAWAL TIERS:*\n"
-        "🥉 <50 refs → Airtime only (min ₦350)\n"
-        "🥇 50+ refs → Up to ₦10,000 cash\n"
-        "💎 100+ refs → Up to ₦25,000 cash\n\n"
-        "💡 Refer friends to unlock cash withdrawals!"
+        "• *Bronze (< 50 referrals):* Airtime only (Min ₦350).\n"
+        "• *Gold (50+ referrals):* Unlocks Bank Cash transfers up to *₦10,000*.\n"
+        "• *Diamond (100+ referrals):* Unlocks Bank Cash transfers up to *₦25,000*.\n\n"
+        "⚡ Airtime is delivered instantly via IA-Café.\n"
+        "🏦 Cash withdrawals are reviewed and credited directly to your bank account."
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    if update.message:
+        await update.message.reply_text(help_message, parse_mode="Markdown")
+    elif update.callback_query:
+        await update.callback_query.message.reply_text(help_message, parse_mode="Markdown")
 
-# ──────────────────────────────────────────────
-# COMMAND: /balance
-# ──────────────────────────────────────────────
-async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     user_data = get_user(user_id)
     if not user_data:
-        await update.message.reply_text("❌ Please /start first.")
         return
 
     balance = user_data.get("balance", 0)
-    refs = len(user_data.get("referrals", []))
-    tier = get_user_tier(refs)
+    referrals = len(user_data.get("referrals", []))
+    tier = get_user_tier(referrals)
 
-    await update.message.reply_text(
-        f"💰 *Your Balance: ₦{balance}*\n\n"
-        f"👥 Referrals: {refs}\n"
-        f"🏆 Tier: {tier['label']}\n"
-        f"💵 Max Cash Withdrawal: ₦{tier['max_cash']:,}",
-        parse_mode="Markdown"
+    msg = (
+        f"💳 *YOUR ACCOUNT STATUS*\n\n"
+        f"💰 Available Balance: *₦{balance:,}*\n"
+        f"👥 Active Referrals: *{referrals}*\n"
+        f"🎖️ Status Tier: *{tier['label']}*\n"
+        f"🏦 Cash Withdrawal Limit: *₦{tier['max_cash']:,}*"
     )
+    if update.message:
+        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=build_main_keyboard())
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(msg, parse_mode="Markdown", reply_markup=build_main_keyboard())
 
-# ──────────────────────────────────────────────
-# COMMAND: /refer
-# ──────────────────────────────────────────────
-async def cmd_refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     user_data = get_user(user_id)
     if not user_data:
-        await update.message.reply_text("❌ Please /start first.")
         return
 
-    bot_username = context.bot.username
-    link = f"https://t.me/{bot_username}?start={user_id}"
-    refs = len(user_data.get("referrals", []))
+    bot_tag = context.bot.username
+    ref_link = f"https://t.me/{bot_tag}?start={user_id}"
+    total_refs = len(user_data.get("referrals", []))
+    tier = get_user_tier(total_refs)
 
-    await update.message.reply_text(
-        f"🔗 *Your Referral Link:*\n`{link}`\n\n"
-        f"👥 Referrals so far: {refs}\n"
-        f"💰 Earn ₦30-50 per referral!\n\n"
-        f"Share this link and earn passive income! 🚀",
-        parse_mode="Markdown"
+    msg = (
+        f"🔗 *YOUR EXCLUSIVE REFERRAL LINK*\n\n"
+        f"`{ref_link}`\n\n"
+        f"📈 *Total Invited:* {total_refs}\n"
+        f"🎖️ *Current Rank:* {tier['label']}\n\n"
+        f"🎯 *Milestones:*\n"
+        f"• 50 invites ➔ Unlock ₦10,000 Bank Cash Withdrawal\n"
+        f"• 100 invites ➔ Unlock ₦25,000 Bank Cash Withdrawal\n\n"
+        f"Share your link and earn ₦30 - ₦50 per friend!"
     )
+    if update.message:
+        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=build_main_keyboard())
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(msg, parse_mode="Markdown", reply_markup=build_main_keyboard())
 
-# ──────────────────────────────────────────────
-# COMMAND: /daily
-# ──────────────────────────────────────────────
-async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     user_data = get_user(user_id)
     if not user_data:
-        await update.message.reply_text("❌ Please /start first.")
         return
 
-    last_checkin = user_data.get("last_checkin", "")
+    last_checkin_str = user_data.get("last_checkin", "")
     now = datetime.now()
 
-    if last_checkin:
-        last_dt = datetime.fromisoformat(last_checkin)
-        diff = now - last_dt
-        if diff < timedelta(hours=DAILY_COOLDOWN_HOURS):
-            remaining = timedelta(hours=DAILY_COOLDOWN_HOURS) - diff
+    if last_checkin_str:
+        last_dt = datetime.fromisoformat(last_checkin_str)
+        if now - last_dt < timedelta(hours=DAILY_COOLDOWN_HOURS):
+            remaining = timedelta(hours=DAILY_COOLDOWN_HOURS) - (now - last_dt)
             hours_left = int(remaining.total_seconds() // 3600)
             mins_left = int((remaining.total_seconds() % 3600) // 60)
-            await update.message.reply_text(
-                f"⏳ You already claimed today!\n"
-                f"Come back in {hours_left}h {mins_left}m"
-            )
+            wait_text = f"⏳ *Cooldown Active*\n\nYou already claimed today's bonus.\nReturn in *{hours_left}h {mins_left}m*."
+            if update.message:
+                await update.message.reply_text(wait_text, parse_mode="Markdown")
+            elif update.callback_query:
+                await update.callback_query.answer(f"Come back in {hours_left}h {mins_left}m", show_alert=True)
             return
 
     new_balance = user_data.get("balance", 0) + DAILY_BONUS
@@ -409,818 +425,670 @@ async def cmd_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "last_checkin": now.isoformat()
     })
 
-    await update.message.reply_text(
-        f"✅ Daily bonus claimed!\n"
-        f"🎁 +₦{DAILY_BONUS}\n"
-        f"💰 New balance: ₦{new_balance}"
-    )
+    success_msg = f"🎁 *Daily Bonus Claimed!*\n\n+₦{DAILY_BONUS} has been added to your wallet.\n💰 New Balance: *₦{new_balance:,}*"
+    if update.message:
+        await update.message.reply_text(success_msg, parse_mode="Markdown", reply_markup=build_main_keyboard())
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(success_msg, parse_mode="Markdown", reply_markup=build_main_keyboard())
 
-# ──────────────────────────────────────────────
-# COMMAND: /history
-# ──────────────────────────────────────────────
-async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     user_data = get_user(user_id)
     if not user_data:
-        await update.message.reply_text("❌ Please /start first.")
         return
 
     withdrawals = user_data.get("withdrawals", [])
-    refs = len(user_data.get("referrals", []))
-
-    text = f"📜 *Transaction History*\n\n👥 Total Referrals: {refs}\n\n"
-
     if not withdrawals:
-        text += "❌ No withdrawals yet."
+        msg = "📜 *Transaction Log*\n\nNo withdrawals requested yet."
     else:
-        for w in withdrawals[-10:]:  # Last 10
-            wtype = w.get("type", "airtime")
-            icon = "📱" if wtype == "airtime" else "🏦"
-            text += (
-                f"{icon} ₦{w['amount']:,} ({wtype})\n"
-                f"   Status: {w['status']}\n"
-                f"   Date: {w.get('date', 'N/A')}\n\n"
-            )
+        msg = "📜 *Recent Transactions (Last 8):*\n\n"
+        for item in reversed(withdrawals[-8:]):
+            kind = "📱 Airtime" if item.get("type") == "airtime" else "🏦 Cash"
+            date_str = item.get("date", "N/A")[:10]
+            msg += f"• {kind} | *₦{item.get('amount', 0):,}* | `{item.get('status')}` ({date_str})\n"
 
-    await update.message.reply_text(text, parse_mode="Markdown")
+    if update.message:
+        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=build_main_keyboard())
+    elif update.callback_query:
+        await update.callback_query.edit_message_text(msg, parse_mode="Markdown", reply_markup=build_main_keyboard())
 
 # ──────────────────────────────────────────────
-# WITHDRAWAL CONVERSATION HANDLER
+# WITHDRAWAL CONVERSATION (AIRTIME & CASH)
 # ──────────────────────────────────────────────
-async def withdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def conv_withdraw_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     user_data = get_user(user_id)
-
     if not user_data:
-        await update.message.reply_text("❌ Please /start first.")
         return ConversationHandler.END
 
     balance = user_data.get("balance", 0)
-    refs = len(user_data.get("referrals", []))
-    tier = get_user_tier(refs)
+    referrals = len(user_data.get("referrals", []))
+    tier = get_user_tier(referrals)
 
     if balance < MIN_WITHDRAW_AIRTIME:
-        await update.message.reply_text(
-            f"❌ Minimum balance for withdrawal is ₦{MIN_WITHDRAW_AIRTIME}.\n"
-            f"Your balance: ₦{balance}"
-        )
+        msg = f"❌ *Insufficient Balance*\n\nMinimum payout is *₦{MIN_WITHDRAW_AIRTIME}*.\nYour balance: ₦{balance}"
+        if update.message:
+            await update.message.reply_text(msg, parse_mode="Markdown")
+        elif update.callback_query:
+            await update.callback_query.message.reply_text(msg, parse_mode="Markdown")
         return ConversationHandler.END
 
-    keyboard = [
-        [InlineKeyboardButton("📱 Airtime", callback_data="w_airtime")],
+    buttons = [
+        [InlineKeyboardButton("📱 Instant Airtime Recharge", callback_data="payout_airtime")]
     ]
-
-    if tier["max_cash"] > 0:
-        keyboard.append([
-            InlineKeyboardButton(f"🏦 Cash (up to ₦{tier['max_cash']:,})", callback_data="w_cash")
-        ])
+    if tier["cash_eligible"]:
+        buttons.append([InlineKeyboardButton(f"🏦 Bank Transfer (Max ₦{tier['max_cash']:,})", callback_data="payout_cash")])
     else:
-        keyboard.append([
-            InlineKeyboardButton("🔒 Cash (need 50+ refs)", callback_data="w_cash_locked")
-        ])
+        buttons.append([InlineKeyboardButton("🔒 Bank Transfer (Requires 50+ Referrals)", callback_data="payout_cash_locked")])
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="payout_cancel")])
 
-    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="w_cancel")])
-
-    await update.message.reply_text(
-        f"💸 *Withdrawal Menu*\n\n"
-        f"💰 Balance: ₦{balance}\n"
-        f"🏆 Tier: {tier['label']}\n\n"
-        f"Choose withdrawal type:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
+    text = (
+        f"💸 *WITHDRAWAL PORTAL*\n\n"
+        f"💰 Available Funds: *₦{balance:,}*\n"
+        f"🎖️ Status: *{tier['label']}*\n\n"
+        f"Select your preferred payout method:"
     )
+
+    if update.message:
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+    elif update.callback_query:
+        await update.callback_query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+
     return CHOOSING_TYPE
 
-async def withdraw_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def conv_type_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     choice = query.data
 
-    if choice == "w_cancel" or choice == "w_cash_locked":
-        if choice == "w_cash_locked":
-            await query.edit_message_text(
-                "🔒 Cash withdrawal requires 50+ referrals.\n"
-                "Keep sharing your referral link! /refer"
-            )
-        else:
-            await query.edit_message_text("❌ Withdrawal cancelled.")
+    if choice == "payout_cancel":
+        await query.edit_message_text("❌ Withdrawal cancelled.")
+        context.user_data.clear()
         return ConversationHandler.END
 
-    context.user_data["withdraw_type"] = "airtime" if choice == "w_airtime" else "cash"
-
-    if choice == "w_airtime":
+    if choice == "payout_cash_locked":
         await query.edit_message_text(
-            "📱 *Airtime Withdrawal*\n\n"
-            "Enter your 11-digit phone number:\n"
-            "Example: `08012345678`",
+            "🔒 *Cash Withdrawal Locked*\n\n"
+            "You need at least *50 verified referrals* to unlock direct bank cash transfers.\n"
+            "Share your /refer link to unlock this feature!",
+            parse_mode="Markdown"
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    if choice == "payout_airtime":
+        context.user_data["payout_type"] = "airtime"
+        await query.edit_message_text(
+            "📱 *Direct Airtime Recharge*\n\n"
+            "Enter the 11-digit phone number to recharge:\n"
+            "Example: `08031234567`",
             parse_mode="Markdown"
         )
         return AIRTIME_PHONE
 
-    elif choice == "w_cash":
+    if choice == "payout_cash":
         user_id = str(update.effective_user.id)
         user_data = get_user(user_id)
-        refs = len(user_data.get("referrals", []))
-        tier = get_user_tier(refs)
+        tier = get_user_tier(len(user_data.get("referrals", [])))
+        context.user_data["payout_type"] = "cash"
+        context.user_data["tier_limit"] = tier["max_cash"]
 
         await query.edit_message_text(
-            f"🏦 *Cash Withdrawal*\n\n"
-            f"Max amount: ₦{tier['max_cash']:,}\n"
-            f"Enter amount to withdraw (min ₦{MIN_WITHDRAW_AIRTIME}):",
+            f"🏦 *Direct Bank Transfer*\n\n"
+            f"Tier Limit: *₦{tier['max_cash']:,}*\n"
+            f"Minimum: *₦{MIN_WITHDRAW_AIRTIME}*\n\n"
+            f"Enter the amount in Naira to withdraw:",
             parse_mode="Markdown"
         )
         return CASH_AMOUNT
 
-async def airtime_phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone_raw = update.message.text.strip()
-    phone = validate_phone(phone_raw)
+# ── Airtime Sub-flow ──
+async def conv_airtime_phone_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw_phone = update.message.text.strip()
+    valid_phone = validate_nigerian_phone(raw_phone)
 
-    if not phone:
-        await update.message.reply_text(
-            "❌ Invalid phone number.\n"
-            "Enter a valid 11-digit Nigerian number.\n"
-            "Example: `08012345678`",
-            parse_mode="Markdown"
-        )
+    if not valid_phone:
+        await update.message.reply_text("❌ Invalid phone number. Enter a valid 11-digit Nigerian number:")
         return AIRTIME_PHONE
 
-    network = detect_network(phone)
-    if not network:
-        await update.message.reply_text(
-            "❌ Could not detect network from phone number.\n"
-            "Please enter a valid MTN, Airtel, Glo, or 9mobile number."
-        )
+    carrier = detect_carrier(valid_phone)
+    if not carrier:
+        await update.message.reply_text("❌ Network not recognized. Please enter a valid MTN, Airtel, Glo, or 9mobile number:")
         return AIRTIME_PHONE
 
-    context.user_data["airtime_phone"] = phone
-    context.user_data["airtime_network"] = network
+    context.user_data["phone"] = valid_phone
+    context.user_data["service_id"] = carrier
+    min_amount = NETWORK_MIN.get(carrier, 50)
 
     await update.message.reply_text(
-        f"✅ Phone: `{phone}`\n"
-        f"📶 Network: {NETWORK_DISPLAY[network]}\n\n"
-        f"Enter amount (min ₦{NETWORK_MIN_AMOUNT[network]}, max ₦50,000):",
+        f"📱 *Phone:* `{valid_phone}`\n"
+        f"📶 *Network:* {NETWORK_NAMES[carrier]}\n\n"
+        f"Enter the recharge amount (Min: ₦{min_amount}, Max: ₦50,000):",
         parse_mode="Markdown"
     )
     return AIRTIME_AMOUNT
 
-async def airtime_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def conv_airtime_amount_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        amount = int(update.message.text.strip())
+        amount = int(re.sub(r"[^\d]", "", update.message.text.strip()))
     except ValueError:
-        await update.message.reply_text("❌ Enter a valid number.")
+        await update.message.reply_text("❌ Please enter a valid numeric amount:")
         return AIRTIME_AMOUNT
 
-    network = context.user_data.get("airtime_network", "mtn")
-    min_amt = NETWORK_MIN_AMOUNT.get(network, 50)
+    carrier = context.user_data.get("service_id", "mtn")
+    min_allowed = NETWORK_MIN.get(carrier, 50)
 
-    if amount < min_amt or amount > 50000:
-        await update.message.reply_text(f"❌ Amount must be between ₦{min_amt} and ₦50,000.")
+    if amount < min_allowed or amount > 50000:
+        await update.message.reply_text(f"❌ Amount must be between ₦{min_allowed} and ₦50,000.")
         return AIRTIME_AMOUNT
 
     user_id = str(update.effective_user.id)
     user_data = get_user(user_id)
-    balance = user_data.get("balance", 0)
-
-    if amount > balance:
-        await update.message.reply_text(f"❌ Insufficient balance. You have ₦{balance}.")
+    if amount > user_data.get("balance", 0):
+        await update.message.reply_text(f"❌ Insufficient balance. Your balance is ₦{user_data.get('balance', 0):,}.")
         return AIRTIME_AMOUNT
 
-    context.user_data["airtime_amount"] = amount
-    phone = context.user_data["airtime_phone"]
+    context.user_data["amount"] = amount
+    phone = context.user_data["phone"]
 
-    keyboard = [
-        [InlineKeyboardButton("✅ Confirm", callback_data="confirm_airtime_yes")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="confirm_airtime_no")],
+    buttons = [
+        [InlineKeyboardButton("✅ Confirm & Dispatch", callback_data="confirm_airtime_yes")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="confirm_airtime_no")]
     ]
 
     await update.message.reply_text(
         f"📋 *Confirm Airtime Purchase*\n\n"
-        f"📱 Phone: `{phone}`\n"
-        f"📶 Network: {NETWORK_DISPLAY[network]}\n"
-        f"💰 Amount: ₦{amount}\n\n"
-        f"This will deduct ₦{amount} from your balance.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        f"📞 *Recipient:* `{phone}`\n"
+        f"📶 *Network:* {NETWORK_NAMES[carrier]}\n"
+        f"💰 *Amount:* ₦{amount:,}\n\n"
+        f"Confirm to send airtime instantly:",
+        reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="Markdown"
     )
     return CONFIRM_AIRTIME
 
-async def confirm_airtime_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def conv_airtime_confirm_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.data == "confirm_airtime_no":
-        await query.edit_message_text("❌ Airtime withdrawal cancelled.")
+    if query.data != "confirm_airtime_yes":
+        await query.edit_message_text("❌ Airtime purchase cancelled.")
         context.user_data.clear()
         return ConversationHandler.END
 
     user_id = str(update.effective_user.id)
-    phone = context.user_data.get("airtime_phone")
-    network = context.user_data.get("airtime_network")
-    amount = context.user_data.get("airtime_amount")
+    phone = context.user_data.get("phone")
+    carrier = context.user_data.get("service_id")
+    amount = context.user_data.get("amount")
 
-    if not all([phone, network, amount]):
-        await query.edit_message_text("❌ Session expired. Try /withdraw again.")
-        context.user_data.clear()
-        return ConversationHandler.END
-
-    # Re-check balance (prevent race condition)
+    # Double check balance to prevent race conditions
     user_data = get_user(user_id)
-    balance = user_data.get("balance", 0)
-    if amount > balance:
-        await query.edit_message_text("❌ Insufficient balance. Try again.")
+    current_balance = user_data.get("balance", 0)
+    if amount > current_balance:
+        await query.edit_message_text("❌ Balance changed. Transaction aborted.")
         context.user_data.clear()
         return ConversationHandler.END
 
-    # Deduct balance FIRST
-    new_balance = balance - amount
-    withdrawal_record = {
+    # Deduct balance
+    new_bal = current_balance - amount
+    history_entry = {
         "type": "airtime",
         "amount": amount,
         "phone": phone,
-        "network": network,
+        "network": NETWORK_NAMES.get(carrier, carrier),
         "status": "processing",
         "date": datetime.now().isoformat()
     }
     withdrawals = user_data.get("withdrawals", [])
-    withdrawals.append(withdrawal_record)
-    save_user(user_id, {
-        "balance": new_balance,
-        "withdrawals": withdrawals
-    })
+    withdrawals.append(history_entry)
+    save_user(user_id, {"balance": new_bal, "withdrawals": withdrawals})
 
-    await query.edit_message_text("⏳ Processing your airtime purchase...")
+    await query.edit_message_text("⚙️ Contacting IA-Café Gateway... Please wait.")
 
     # Call IA-Café API
-    result = purchase_airtime(phone, network, amount, user_id)
+    api_result = await dispatch_airtime_api(phone, carrier, amount, user_id)
 
-    if result.get("code") == "success":
-        status = result.get("data", {}).get("status", "completed-api")
-        # Update withdrawal status
+    if api_result.get("code") == "success":
         withdrawals[-1]["status"] = "completed"
-        withdrawals[-1]["api_order_id"] = result.get("data", {}).get("order_id", "")
+        withdrawals[-1]["order_id"] = api_result.get("data", {}).get("order_id", "")
         save_user(user_id, {"withdrawals": withdrawals})
 
         await context.bot.send_message(
             chat_id=int(user_id),
-            text=f"✅ *Airtime Sent!*\n\n"
-                 f"📱 {phone} ({NETWORK_DISPLAY[network]})\n"
-                 f"💰 ₦{amount}\n"
-                 f"📊 Status: {status}\n"
-                 f"💵 New Balance: ₦{new_balance}",
-            parse_mode="Markdown"
+            text=f"✅ *Airtime Delivered!*\n\n"
+                 f"📱 Phone: `{phone}` ({NETWORK_NAMES[carrier]})\n"
+                 f"💰 Amount: *₦{amount:,}*\n"
+                 f"💵 Balance: *₦{new_bal:,}*",
+            parse_mode="Markdown",
+            reply_markup=build_main_keyboard()
         )
     else:
-        # REFUND on failure
-        error_msg = result.get("message", "Unknown error")
-        if isinstance(result.get("error"), dict):
-            error_msg = result["error"].get("message", error_msg)
+        # Automatic Refund
+        error_detail = api_result.get("message", "API Gateway Error")
+        if isinstance(api_result.get("error"), dict):
+            error_detail = api_result["error"].get("message", error_detail)
 
-        refunds_balance = new_balance + amount
-        withdrawals[-1]["status"] = f"failed: {error_msg}"
-        save_user(user_id, {
-            "balance": refunds_balance,
-            "withdrawals": withdrawals
-        })
+        refund_bal = new_bal + amount
+        withdrawals[-1]["status"] = f"failed: {error_detail}"
+        save_user(user_id, {"balance": refund_bal, "withdrawals": withdrawals})
 
         await context.bot.send_message(
             chat_id=int(user_id),
             text=f"❌ *Airtime Purchase Failed*\n\n"
-                 f"Error: {error_msg}\n"
-                 f"💰 ₦{amount} has been refunded.\n"
-                 f"💵 Balance: ₦{refunds_balance}",
-            parse_mode="Markdown"
+                 f"Reason: `{error_detail}`\n"
+                 f"💰 *₦{amount:,}* has been refunded to your wallet.\n"
+                 f"💵 Balance: *₦{refund_bal:,}*",
+            parse_mode="Markdown",
+            reply_markup=build_main_keyboard()
         )
 
     context.user_data.clear()
     return ConversationHandler.END
 
-# ── CASH WITHDRAWAL FLOW ──
-async def cash_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ── Cash Sub-flow ──
+async def conv_cash_amount_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        amount = int(update.message.text.strip())
+        amount = int(re.sub(r"[^\d]", "", update.message.text.strip()))
     except ValueError:
-        await update.message.reply_text("❌ Enter a valid number.")
+        await update.message.reply_text("❌ Enter a valid numeric amount:")
         return CASH_AMOUNT
 
     user_id = str(update.effective_user.id)
     user_data = get_user(user_id)
     balance = user_data.get("balance", 0)
-    refs = len(user_data.get("referrals", []))
-    tier = get_user_tier(refs)
+    tier_limit = context.user_data.get("tier_limit", 10000)
 
     if amount < MIN_WITHDRAW_AIRTIME:
         await update.message.reply_text(f"❌ Minimum withdrawal is ₦{MIN_WITHDRAW_AIRTIME}.")
         return CASH_AMOUNT
 
-    if amount > tier["max_cash"]:
-        await update.message.reply_text(f"❌ Max cash withdrawal for your tier is ₦{tier['max_cash']:,}.")
+    if amount > tier_limit:
+        await update.message.reply_text(f"❌ Amount exceeds your tier limit of ₦{tier_limit:,}.")
         return CASH_AMOUNT
 
     if amount > balance:
-        await update.message.reply_text(f"❌ Insufficient balance. You have ₦{balance}.")
+        await update.message.reply_text(f"❌ Insufficient balance. You have ₦{balance:,}.")
         return CASH_AMOUNT
 
     context.user_data["cash_amount"] = amount
-    await update.message.reply_text("🏦 Enter your *bank name*:\nExample: `GTBank`", parse_mode="Markdown")
+    await update.message.reply_text("🏦 Enter your *Bank Name* (e.g. OPay, PalmPay, GTBank, Zenith):", parse_mode="Markdown")
     return CASH_BANK
 
-async def cash_bank_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bank = update.message.text.strip()
-    if len(bank) < 3:
-        await update.message.reply_text("❌ Enter a valid bank name.")
+async def conv_cash_bank_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bank_name = update.message.text.strip()
+    if len(bank_name) < 2:
+        await update.message.reply_text("❌ Please enter a valid bank name:")
         return CASH_BANK
 
-    context.user_data["cash_bank"] = bank
-    await update.message.reply_text("🔢 Enter your *account number* (10 digits):", parse_mode="Markdown")
+    context.user_data["cash_bank"] = bank_name
+    await update.message.reply_text("🔢 Enter your *10-digit Account Number*:", parse_mode="Markdown")
     return CASH_ACCOUNT
 
-async def cash_account_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    account = re.sub(r"[^\d]", "", update.message.text.strip())
-    if len(account) != 10:
-        await update.message.reply_text("❌ Account number must be 10 digits.")
+async def conv_cash_account_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    account_num = re.sub(r"[^\d]", "", update.message.text.strip())
+    if len(account_num) != 10:
+        await update.message.reply_text("❌ Account number must be 10 digits:")
         return CASH_ACCOUNT
 
-    context.user_data["cash_account"] = account
-    await update.message.reply_text("👤 Enter your *account name* (as it appears on your bank):", parse_mode="Markdown")
+    context.user_data["cash_account"] = account_num
+    await update.message.reply_text("👤 Enter your *Account Name* (as registered in your bank):", parse_mode="Markdown")
     return CASH_NAME
 
-async def cash_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = update.message.text.strip()
-    if len(name) < 3:
-        await update.message.reply_text("❌ Enter a valid account name.")
+async def conv_cash_name_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    acc_name = update.message.text.strip()
+    if len(acc_name) < 3:
+        await update.message.reply_text("❌ Enter full account name:")
         return CASH_NAME
 
-    context.user_data["cash_name"] = name
+    context.user_data["cash_name"] = acc_name
     amount = context.user_data["cash_amount"]
     bank = context.user_data["cash_bank"]
     account = context.user_data["cash_account"]
 
-    keyboard = [
-        [InlineKeyboardButton("✅ Confirm", callback_data="confirm_cash_yes")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="confirm_cash_no")],
+    buttons = [
+        [InlineKeyboardButton("✅ Confirm & Submit", callback_data="confirm_cash_yes")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="confirm_cash_no")]
     ]
 
     await update.message.reply_text(
         f"📋 *Confirm Cash Withdrawal*\n\n"
-        f"💰 Amount: ₦{amount:,}\n"
-        f"🏦 Bank: {bank}\n"
-        f"🔢 Account: {account}\n"
-        f"👤 Name: {name}\n\n"
-        f"⚠️ This will be reviewed by an admin before processing.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        f"💰 *Amount:* ₦{amount:,}\n"
+        f"🏦 *Bank:* {bank}\n"
+        f"🔢 *Account:* `{account}`\n"
+        f"👤 *Name:* {acc_name}\n\n"
+        f"⚠️ Cash payouts will be processed by the admin.",
+        reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="Markdown"
     )
     return CONFIRM_CASH
 
-async def confirm_cash_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def conv_cash_confirm_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.data == "confirm_cash_no":
+    if query.data != "confirm_cash_yes":
         await query.edit_message_text("❌ Cash withdrawal cancelled.")
         context.user_data.clear()
         return ConversationHandler.END
 
     user_id = str(update.effective_user.id)
-    user_data = get_user(user_id)
     amount = context.user_data.get("cash_amount")
     bank = context.user_data.get("cash_bank")
     account = context.user_data.get("cash_account")
     name = context.user_data.get("cash_name")
 
-    if not all([amount, bank, account, name]):
-        await query.edit_message_text("❌ Session expired. Try /withdraw again.")
-        context.user_data.clear()
-        return ConversationHandler.END
-
-    # Re-check balance
+    user_data = get_user(user_id)
     balance = user_data.get("balance", 0)
+
     if amount > balance:
         await query.edit_message_text("❌ Insufficient balance.")
         context.user_data.clear()
         return ConversationHandler.END
 
-    # Deduct balance
-    new_balance = balance - amount
-    w_id = f"cash_{user_id}_{int(time.time())}"
+    new_bal = balance - amount
+    req_id = f"c_{user_id}_{int(time.time())}"
 
-    withdrawal_record = {
+    record = {
         "type": "cash",
         "amount": amount,
         "bank": bank,
         "account": account,
         "account_name": name,
-        "status": "pending",
-        "date": datetime.now().isoformat(),
-        "w_id": w_id
+        "status": "pending_approval",
+        "req_id": req_id,
+        "date": datetime.now().isoformat()
     }
-
     withdrawals = user_data.get("withdrawals", [])
-    withdrawals.append(withdrawal_record)
-    save_user(user_id, {
-        "balance": new_balance,
-        "withdrawals": withdrawals
-    })
+    withdrawals.append(record)
+    save_user(user_id, {"balance": new_bal, "withdrawals": withdrawals})
 
-    # Save to pending queue for admin
-    save_pending_withdrawal(w_id, {
+    save_pending_withdrawal(req_id, {
         "user_id": user_id,
-        "username": user_data.get("username", "Unknown"),
+        "username": user_data.get("username", "User"),
         "amount": amount,
         "bank": bank,
         "account": account,
         "account_name": name,
-        "date": datetime.now().isoformat(),
-        "status": "pending"
+        "req_id": req_id,
+        "date": datetime.now().isoformat()
     })
 
-    # Notify admins
+    # Alert all authenticated admins
     all_users = get_all_users()
     for uid, udata in all_users.items():
         if udata.get("is_admin"):
             try:
                 await context.bot.send_message(
                     chat_id=int(uid),
-                    text=f"🚨 *New Cash Withdrawal Request*\n\n"
-                         f"👤 User: {user_data.get('username')} (`{user_id}`)\n"
-                         f"💰 Amount: ₦{amount:,}\n"
-                         f"🏦 Bank: {bank}\n"
-                         f"🔢 Account: {account}\n"
-                         f"👤 Name: {name}\n"
-                         f"🆔 ID: `{w_id}`\n\n"
-                         f"Use /approve `{w_id}` or /reject `{w_id}`",
+                    text=f"🚨 *NEW CASH WITHDRAWAL REQUEST*\n\n"
+                         f"👤 *User:* {user_data.get('username')} (`{user_id}`)\n"
+                         f"💰 *Amount:* ₦{amount:,}\n"
+                         f"🏦 *Bank:* {bank}\n"
+                         f"🔢 *Account:* `{account}`\n"
+                         f"👤 *Name:* {name}\n"
+                         f"🆔 *ID:* `{req_id}`\n\n"
+                         f"Actions:\n`/approve {req_id}`\n`/reject {req_id}`",
                     parse_mode="Markdown"
                 )
             except Exception:
                 pass
 
     await query.edit_message_text(
-        f"✅ *Cash Withdrawal Submitted!*\n\n"
-        f"💰 ₦{amount:,}\n"
-        f"🏦 {bank} - {account}\n"
-        f"📊 Status: Pending admin approval\n"
-        f"💵 New Balance: ₦{new_balance}\n\n"
-        f"You'll be notified when processed.",
+        f"✅ *Request Submitted!*\n\n"
+        f"💰 Amount: *₦{amount:,}*\n"
+        f"🏦 Bank: {bank} - `{account}`\n"
+        f"💵 Balance: *₦{new_bal:,}*\n\n"
+        f"Your request has been sent to admin for approval.",
         parse_mode="Markdown"
     )
-
     context.user_data.clear()
     return ConversationHandler.END
 
-async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Withdrawal cancelled.")
+async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Withdrawal process cancelled.")
     context.user_data.clear()
     return ConversationHandler.END
 
 # ──────────────────────────────────────────────
 # ADMIN COMMANDS
 # ──────────────────────────────────────────────
-async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_admin_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    code = context.args[0] if context.args else ""
+    provided_code = context.args[0] if context.args else ""
 
-    if not code:
-        await update.message.reply_text("Usage: /admin <your_code>")
-        return
-
-    if code in ADMIN_CODES:
+    if provided_code in ADMIN_CODES and provided_code != "":
         save_user(user_id, {"is_admin": True})
         await update.message.reply_text(
-            "✅ *Admin access granted!*\n\n"
-            "Available commands:\n"
-            "/pending — View pending withdrawals\n"
-            "/approve <id> — Approve cash withdrawal\n"
-            "/reject <id> — Reject & refund\n"
-            "/stats — Bot statistics\n"
-            "/broadcast <msg> — Send to all users",
+            "🛡️ *Admin Access Granted!*\n\n"
+            "Admin Commands:\n"
+            "• `/pending` — List pending cash requests\n"
+            "• `/approve <id>` — Approve withdrawal\n"
+            "• `/reject <id>` — Reject and refund\n"
+            "• `/stats` — Live metrics\n"
+            "• `/broadcast <msg>` — Send to all users",
             parse_mode="Markdown"
         )
     else:
         await update.message.reply_text("❌ Invalid admin code.")
 
-async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_admin_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    if not is_admin(user_id):
-        await update.message.reply_text("❌ Admin only.")
+    if not get_user(user_id).get("is_admin"):
         return
 
     pending = get_pending_withdrawals()
     if not pending:
-        await update.message.reply_text("✅ No pending withdrawals.")
+        await update.message.reply_text("✅ No cash withdrawals currently pending.")
         return
 
-    text = "📋 *Pending Cash Withdrawals*\n\n"
-    for w_id, w in pending.items():
-        text += (
-            f"🆔 `{w_id}`\n"
-            f"👤 {w.get('username')} ({w.get('user_id')})\n"
-            f"💰 ₦{w.get('amount', 0):,}\n"
-            f"🏦 {w.get('bank')} - {w.get('account')}\n"
-            f"👤 {w.get('account_name')}\n\n"
+    msg = "📋 *Pending Cash Withdrawals:*\n\n"
+    for req_id, data in pending.items():
+        msg += (
+            f"🆔 `{req_id}`\n"
+            f"👤 {data.get('username')} (`{data.get('user_id')}`)\n"
+            f"💰 *₦{data.get('amount', 0):,}*\n"
+            f"🏦 {data.get('bank')} | `{data.get('account')}`\n"
+            f"👤 {data.get('account_name')}\n\n"
         )
+    msg += "To approve: `/approve <id>`\nTo reject: `/reject <id>`"
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
-    text += "Use /approve <id> or /reject <id>"
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_admin_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    if not is_admin(user_id):
-        await update.message.reply_text("❌ Admin only.")
+    if not get_user(user_id).get("is_admin"):
         return
 
-    w_id = context.args[0] if context.args else ""
-    if not w_id:
-        await update.message.reply_text("Usage: /approve <withdrawal_id>")
-        return
-
+    req_id = context.args[0] if context.args else ""
     pending = get_pending_withdrawals()
-    if w_id not in pending:
-        await update.message.reply_text("❌ Withdrawal not found.")
+
+    if req_id not in pending:
+        await update.message.reply_text("❌ Request ID not found in pending list.")
         return
 
-    w = pending[w_id]
-    target_user_id = w["user_id"]
+    item = pending[req_id]
+    target_uid = item["user_id"]
+    target_user = get_user(target_uid)
 
-    # Update user's withdrawal status
-    user_data = get_user(target_user_id)
-    withdrawals = user_data.get("withdrawals", [])
-    for wd in withdrawals:
-        if wd.get("w_id") == w_id:
-            wd["status"] = "approved ✅"
+    withdrawals = target_user.get("withdrawals", [])
+    for w in withdrawals:
+        if w.get("req_id") == req_id:
+            w["status"] = "paid_approved"
             break
-    save_user(target_user_id, {"withdrawals": withdrawals})
+    save_user(target_uid, {"withdrawals": withdrawals})
+    delete_pending_withdrawal(req_id)
 
-    # Remove from pending
-    delete_pending_withdrawal(w_id)
-
-    # Notify user
     try:
         await context.bot.send_message(
-            chat_id=int(target_user_id),
-            text=f"✅ *Withdrawal Approved!*\n\n"
-                 f"💰 ₦{w['amount']:,}\n"
-                 f"🏦 {w['bank']} - {w['account']}\n"
-                 f"Your payment is being processed.",
+            chat_id=int(target_uid),
+            text=f"🎉 *Cash Withdrawal Approved!*\n\n"
+                 f"💰 Amount: *₦{item['amount']:,}*\n"
+                 f"🏦 Account: {item['bank']} (`{item['account']}`)\n\n"
+                 f"Funds have been transferred to your bank account.",
             parse_mode="Markdown"
         )
     except Exception:
         pass
 
-    await update.message.reply_text(f"✅ Approved {w_id} for ₦{w['amount']:,}")
+    await update.message.reply_text(f"✅ Approved payout `{req_id}` for ₦{item['amount']:,}.")
 
-async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_admin_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    if not is_admin(user_id):
-        await update.message.reply_text("❌ Admin only.")
+    if not get_user(user_id).get("is_admin"):
         return
 
-    w_id = context.args[0] if context.args else ""
-    if not w_id:
-        await update.message.reply_text("Usage: /reject <withdrawal_id>")
-        return
-
+    req_id = context.args[0] if context.args else ""
     pending = get_pending_withdrawals()
-    if w_id not in pending:
-        await update.message.reply_text("❌ Withdrawal not found.")
+
+    if req_id not in pending:
+        await update.message.reply_text("❌ Request ID not found.")
         return
 
-    w = pending[w_id]
-    target_user_id = w["user_id"]
-    amount = w["amount"]
+    item = pending[req_id]
+    target_uid = item["user_id"]
+    amount = item["amount"]
+    target_user = get_user(target_uid)
 
-    # Refund user
-    user_data = get_user(target_user_id)
-    new_balance = user_data.get("balance", 0) + amount
-    withdrawals = user_data.get("withdrawals", [])
-    for wd in withdrawals:
-        if wd.get("w_id") == w_id:
-            wd["status"] = "rejected ❌ (refunded)"
+    new_bal = target_user.get("balance", 0) + amount
+    withdrawals = target_user.get("withdrawals", [])
+    for w in withdrawals:
+        if w.get("req_id") == req_id:
+            w["status"] = "rejected_refunded"
             break
-    save_user(target_user_id, {
-        "balance": new_balance,
-        "withdrawals": withdrawals
-    })
 
-    delete_pending_withdrawal(w_id)
+    save_user(target_uid, {"balance": new_bal, "withdrawals": withdrawals})
+    delete_pending_withdrawal(req_id)
 
     try:
         await context.bot.send_message(
-            chat_id=int(target_user_id),
-            text=f"❌ *Withdrawal Rejected*\n\n"
-                 f"💰 ₦{amount:,} has been refunded.\n"
-                 f"💵 New Balance: ₦{new_balance}\n\n"
-                 f"Contact support if you have questions.",
+            chat_id=int(target_uid),
+            text=f"❌ *Cash Withdrawal Declined*\n\n"
+                 f"💰 *₦{amount:,}* has been refunded to your wallet.\n"
+                 f"💵 Balance: *₦{new_bal:,}*",
             parse_mode="Markdown"
         )
     except Exception:
         pass
 
-    await update.message.reply_text(f"❌ Rejected {w_id}. ₦{amount:,} refunded.")
+    await update.message.reply_text(f"❌ Rejected `{req_id}`. ₦{amount:,} refunded.")
 
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    if not is_admin(user_id):
-        await update.message.reply_text("❌ Admin only.")
+    if not get_user(user_id).get("is_admin"):
         return
 
     all_users = get_all_users()
     total_users = len(all_users)
-    total_balance = sum(u.get("balance", 0) for u in all_users.values())
+    total_wallet = sum(u.get("balance", 0) for u in all_users.values())
     total_refs = sum(len(u.get("referrals", [])) for u in all_users.values())
-    pending = get_pending_withdrawals()
+    pending_count = len(get_pending_withdrawals())
 
     await update.message.reply_text(
-        f"📊 *Bot Statistics*\n\n"
-        f"👥 Total Users: {total_users}\n"
-        f"💰 Total Balance: ₦{total_balance:,}\n"
-        f"🔗 Total Referrals: {total_refs}\n"
-        f"⏳ Pending Withdrawals: {len(pending)}",
+        f"📊 *BOT PERFORMANCE METRICS*\n\n"
+        f"👥 Total Users: *{total_users:,}*\n"
+        f"💰 Total Wallet Balances: *₦{total_wallet:,}*\n"
+        f"🔗 Total Referrals: *{total_refs:,}*\n"
+        f"⏳ Pending Cash Requests: *{pending_count}*",
         parse_mode="Markdown"
     )
 
-async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    if not is_admin(user_id):
-        await update.message.reply_text("❌ Admin only.")
+    if not get_user(user_id).get("is_admin"):
         return
 
-    message = " ".join(context.args) if context.args else ""
-    if not message:
-        await update.message.reply_text("Usage: /broadcast <message>")
+    msg = " ".join(context.args) if context.args else ""
+    if not msg:
+        await update.message.reply_text("Usage: `/broadcast <message>`", parse_mode="Markdown")
         return
 
     all_users = get_all_users()
-    sent = 0
-    failed = 0
+    sent_count, fail_count = 0, 0
 
     for uid in all_users:
         try:
-            await context.bot.send_message(chat_id=int(uid), text=message)
-            sent += 1
+            await context.bot.send_message(chat_id=int(uid), text=msg, parse_mode="Markdown")
+            sent_count += 1
         except Exception:
-            failed += 1
+            fail_count += 1
 
-    await update.message.reply_text(f"📢 Broadcast complete.\n✅ Sent: {sent}\n❌ Failed: {failed}")
+    await update.message.reply_text(
+        f"📢 *Broadcast Complete:*\n✅ Delivered: {sent_count}\n❌ Failed: {fail_count}"
+    )
 
 # ──────────────────────────────────────────────
-# INLINE MENU CALLBACK HANDLER
+# MENU ROUTER
 # ──────────────────────────────────────────────
-async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data
+    route = query.data
 
-    if data == "menu_balance":
-        user_id = str(update.effective_user.id)
-        user_data = get_user(user_id)
-        if not user_data:
-            await query.edit_message_text("❌ Please /start first.")
-            return
-        balance = user_data.get("balance", 0)
-        refs = len(user_data.get("referrals", []))
-        tier = get_user_tier(refs)
-        await query.edit_message_text(
-            f"💰 Balance: ₦{balance}\n👥 Referrals: {refs}\n🏆 {tier['label']}",
-            reply_markup=main_menu_keyboard()
-        )
-
-    elif data == "menu_refer":
-        user_id = str(update.effective_user.id)
-        link = f"https://t.me/{context.bot.username}?start={user_id}"
-        await query.edit_message_text(
-            f"🔗 Your referral link:\n`{link}`\n\nShare & earn ₦30-50 per referral!",
-            parse_mode="Markdown",
-            reply_markup=main_menu_keyboard()
-        )
-
-    elif data == "menu_withdraw":
-        await query.edit_message_text("💸 Use /withdraw to start a withdrawal.")
-
-    elif data == "menu_daily":
-        # Trigger daily check-in
-        user_id = str(update.effective_user.id)
-        user_data = get_user(user_id)
-        if not user_data:
-            await query.edit_message_text("❌ Please /start first.")
-            return
-        last_checkin = user_data.get("last_checkin", "")
-        now = datetime.now()
-        if last_checkin:
-            last_dt = datetime.fromisoformat(last_checkin)
-            if now - last_dt < timedelta(hours=DAILY_COOLDOWN_HOURS):
-                remaining = timedelta(hours=DAILY_COOLDOWN_HOURS) - (now - last_dt)
-                h = int(remaining.total_seconds() // 3600)
-                m = int((remaining.total_seconds() % 3600) // 60)
-                await query.edit_message_text(
-                    f"⏳ Already claimed! Come back in {h}h {m}m",
-                    reply_markup=main_menu_keyboard()
-                )
-                return
-        new_balance = user_data.get("balance", 0) + DAILY_BONUS
-        save_user(user_id, {"balance": new_balance, "last_checkin": now.isoformat()})
-        await query.edit_message_text(
-            f"✅ +₦{DAILY_BONUS} daily bonus!\n💰 Balance: ₦{new_balance}",
-            reply_markup=main_menu_keyboard()
-        )
-
-    elif data == "menu_history":
-        user_id = str(update.effective_user.id)
-        user_data = get_user(user_id)
-        withdrawals = user_data.get("withdrawals", []) if user_data else []
-        if not withdrawals:
-            await query.edit_message_text("📜 No transactions yet.", reply_markup=main_menu_keyboard())
-        else:
-            text = "📜 *Recent Transactions*\n\n"
-            for w in withdrawals[-5:]:
-                icon = "📱" if w.get("type") == "airtime" else "🏦"
-                text += f"{icon} ₦{w['amount']:,} — {w['status']}\n"
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
-
-    elif data == "menu_help":
-        await query.edit_message_text(
-            "📖 Use /help for full instructions.",
-            reply_markup=main_menu_keyboard()
-        )
+    if route == "btn_balance":
+        await handle_balance(update, context)
+    elif route == "btn_refer":
+        await handle_refer(update, context)
+    elif route == "btn_daily":
+        await handle_daily(update, context)
+    elif route == "btn_history":
+        await handle_history(update, context)
+    elif route == "btn_help":
+        await handle_help(update, context)
+    elif route == "btn_withdraw":
+        await query.message.reply_text("💸 Type /withdraw to initiate withdrawal.")
 
 # ──────────────────────────────────────────────
-# REGISTER HANDLERS
+# MAIN RUNNER
 # ──────────────────────────────────────────────
-withdraw_conv = ConversationHandler(
-    entry_points=[CommandHandler("withdraw", withdraw_start)],
-    states={
-        CHOOSING_TYPE: [CallbackQueryHandler(withdraw_type_callback, pattern="^w_")],
-        AIRTIME_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, airtime_phone_handler)],
-        AIRTIME_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, airtime_amount_handler)],
-        CONFIRM_AIRTIME: [CallbackQueryHandler(confirm_airtime_callback, pattern="^confirm_airtime_")],
-        CASH_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, cash_amount_handler)],
-        CASH_BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, cash_bank_handler)],
-        CASH_ACCOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, cash_account_handler)],
-        CASH_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, cash_name_handler)],
-        CONFIRM_CASH: [CallbackQueryHandler(confirm_cash_callback, pattern="^confirm_cash_")],
-    },
-    fallbacks=[CommandHandler("cancel", cancel_conversation)],
-    conversation_timeout=300,  # 5 min timeout
-)
+def main():
+    if not BOT_TOKEN:
+        logger.error("❌ BOT_TOKEN is not set in environment variables!")
+        return
 
-application.add_handler(withdraw_conv)
-application.add_handler(CommandHandler("start", cmd_start))
-application.add_handler(CommandHandler("help", cmd_help))
-application.add_handler(CommandHandler("balance", cmd_balance))
-application.add_handler(CommandHandler("refer", cmd_refer))
-application.add_handler(CommandHandler("daily", cmd_daily))
-application.add_handler(CommandHandler("history", cmd_history))
-application.add_handler(CommandHandler("admin", cmd_admin))
-application.add_handler(CommandHandler("pending", cmd_pending))
-application.add_handler(CommandHandler("approve", cmd_approve))
-application.add_handler(CommandHandler("reject", cmd_reject))
-application.add_handler(CommandHandler("stats", cmd_stats))
-application.add_handler(CommandHandler("broadcast", cmd_broadcast))
-application.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu_"))
+    logger.info("🚀 Building Telegram Application...")
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .rate_limiter(AIORateLimiter())
+        .build()
+    )
 
-# ──────────────────────────────────────────────
-# FLASK ROUTES
-# ──────────────────────────────────────────────
-@app.route("/")
-def home():
-    return "✅ Airtime Drop Bot v2.0 is running."
+    withdraw_dialog = ConversationHandler(
+        entry_points=[
+            CommandHandler("withdraw", conv_withdraw_entry),
+            CallbackQueryHandler(conv_withdraw_entry, pattern="^btn_withdraw$")
+        ],
+        states={
+            CHOOSING_TYPE: [CallbackQueryHandler(conv_type_selected, pattern="^payout_")],
+            AIRTIME_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_airtime_phone_step)],
+            AIRTIME_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_airtime_amount_step)],
+            CONFIRM_AIRTIME: [CallbackQueryHandler(conv_airtime_confirm_step, pattern="^confirm_airtime_")],
+            CASH_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_cash_amount_step)],
+            CASH_BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_cash_bank_step)],
+            CASH_ACCOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_cash_account_step)],
+            CASH_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_cash_name_step)],
+            CONFIRM_CASH: [CallbackQueryHandler(conv_cash_confirm_step, pattern="^confirm_cash_")]
+        },
+        fallbacks=[CommandHandler("cancel", conv_cancel)],
+        conversation_timeout=300
+    )
 
-@app.route("/webhook", methods=["POST"])
-def telegram_webhook():
-    try:
-        update = Update.de_json(request.get_json(force=True), application.bot)
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(application.process_update(update))
-        loop.close()
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-    return "ok", 200
+    app.add_handler(withdraw_dialog)
+    app.add_handler(CommandHandler("start", handle_start))
+    app.add_handler(CommandHandler("balance", handle_balance))
+    app.add_handler(CommandHandler("refer", handle_refer))
+    app.add_handler(CommandHandler("daily", handle_daily))
+    app.add_handler(CommandHandler("history", handle_history))
+    app.add_handler(CommandHandler("help", handle_help))
+    app.add_handler(CommandHandler("admin", handle_admin_auth))
+    app.add_handler(CommandHandler("pending", handle_admin_pending))
+    app.add_handler(CommandHandler("approve", handle_admin_approve))
+    app.add_handler(CommandHandler("reject", handle_admin_reject))
+    app.add_handler(CommandHandler("stats", handle_admin_stats))
+    app.add_handler(CommandHandler("broadcast", handle_admin_broadcast))
+    app.add_handler(CallbackQueryHandler(handle_menu_router, pattern="^btn_"))
 
-# ──────────────────────────────────────────────
-# STARTUP
-# ──────────────────────────────────────────────
-def setup_webhook():
-    """Set Telegram webhook on startup."""
-    url = f"{WEBHOOK_URL}/webhook"
-    try:
-        resp = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
-            json={"url": url, "allowed_updates": ["message", "callback_query"]}
-        )
-        logger.info(f"Webhook set: {resp.json()}")
-    except Exception as e:
-        logger.error(f"Webhook setup failed: {e}")
+    logger.info("✅ Airtime Drop Bot is running with polling...")
+    app.run_polling(drop_pending_updates=True)
 
-# Initialize bot application
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-loop.run_until_complete(application.initialize())
-setup_webhook()
-
-# ──────────────────────────────────────────────
-# MAIN
-# ──────────────────────────────────────────────
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    logger.info(f"🚀 Starting server on port {port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    main()
