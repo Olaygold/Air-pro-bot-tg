@@ -1,43 +1,381 @@
 <!DOCTYPE html>
-<html>
+<html lang="en" class="dark">
 <head>
-  <title>Admin Dashboard</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AirDrop Pro — Admin Command Center</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- FontAwesome Icons -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: {
+              50: '#ecfdf5',
+              500: '#10b981',
+              600: '#059669',
+              700: '#047857',
+            },
+            dark: {
+              800: '#1e293b',
+              900: '#0f172a',
+              950: '#020617'
+            }
+          }
+        }
+      }
+    }
+  </script>
 </head>
-<body>
-  <div class="container">
-    <h2>Withdrawal Requests</h2>
-    <a href="/logout" class="logout-btn">Logout</a>
-    {% if withdrawals %}
-      <table>
-        <thead>
-          <tr>
-            <th>User</th>
-            <th>Amount</th>
-            <th>Status</th>
-            <th>Action</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for id, w in withdrawals.items() %}
-            <tr>
-              <td>{{ w.username }}</td>
-              <td>₦{{ w.amount }}</td>
-              <td>{{ w.status }}</td>
-              <td>
-                {% if w.status != "paid" %}
-                  <a href="/mark_paid/{{ id }}" class="btn">Mark as Paid</a>
-                {% else %}
-                  <span class="paid">Paid</span>
-                {% endif %}
-              </td>
+<body class="bg-dark-950 text-slate-100 min-h-screen font-sans antialiased selection:bg-emerald-500 selection:text-white">
+
+  <!-- TOP NAVIGATION BAR -->
+  <nav class="border-b border-slate-800 bg-dark-900/80 backdrop-blur sticky top-0 z-50">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+      <div class="flex items-center justify-between h-16">
+        <div class="flex items-center space-x-3">
+          <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-emerald-600 to-teal-400 flex items-center justify-center shadow-lg shadow-emerald-500/20">
+            <i class="fa-solid fa-bolt text-white text-lg"></i>
+          </div>
+          <div>
+            <span class="font-bold text-lg tracking-tight text-white">AirDrop<span class="text-emerald-400">Pro</span></span>
+            <span class="text-xs ml-2 px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-medium">HQ Console</span>
+          </div>
+        </div>
+
+        <div class="flex items-center space-x-4">
+          <button onclick="window.location.reload()" class="p-2 text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg transition" title="Refresh Feed">
+            <i class="fa-solid fa-rotate-right"></i>
+          </button>
+          <a href="/logout" class="flex items-center space-x-2 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 px-4 py-2 rounded-lg text-sm font-medium transition">
+            <i class="fa-solid fa-arrow-right-from-bracket text-xs"></i>
+            <span>Logout</span>
+          </a>
+        </div>
+      </div>
+    </div>
+  </nav>
+
+  <!-- MAIN WRAPPER -->
+  <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
+
+    <!-- KPI STATS OVERVIEW -->
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+      
+      <!-- Total Requests -->
+      <div class="bg-dark-900 border border-slate-800 rounded-2xl p-5 shadow-sm relative overflow-hidden">
+        <div class="flex items-center justify-between">
+          <div>
+            <p class="text-xs font-semibold uppercase tracking-wider text-slate-400">Total Entries</p>
+            <h3 class="text-2xl font-bold text-white mt-1" id="stat-total">0</h3>
+          </div>
+          <div class="w-12 h-12 rounded-xl bg-blue-500/10 border border-blue-500/20 flex items-center justify-center text-blue-400">
+            <i class="fa-solid fa-layer-group text-lg"></i>
+          </div>
+        </div>
+      </div>
+
+      <!-- Pending Queue -->
+      <div class="bg-dark-900 border border-slate-800 rounded-2xl p-5 shadow-sm relative overflow-hidden">
+        <div class="flex items-center justify-between">
+          <div>
+            <p class="text-xs font-semibold uppercase tracking-wider text-amber-400">Pending Actions</p>
+            <h3 class="text-2xl font-bold text-amber-400 mt-1" id="stat-pending">0</h3>
+          </div>
+          <div class="w-12 h-12 rounded-xl bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-400">
+            <i class="fa-solid fa-clock text-lg"></i>
+          </div>
+        </div>
+      </div>
+
+      <!-- Total Paid Volume -->
+      <div class="bg-dark-900 border border-slate-800 rounded-2xl p-5 shadow-sm relative overflow-hidden">
+        <div class="flex items-center justify-between">
+          <div>
+            <p class="text-xs font-semibold uppercase tracking-wider text-emerald-400">Paid Volume</p>
+            <h3 class="text-2xl font-bold text-emerald-400 mt-1" id="stat-paid-amount">₦0</h3>
+          </div>
+          <div class="w-12 h-12 rounded-xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400">
+            <i class="fa-solid fa-money-bill-wave text-lg"></i>
+          </div>
+        </div>
+      </div>
+
+      <!-- Pending Cash Volume -->
+      <div class="bg-dark-900 border border-slate-800 rounded-2xl p-5 shadow-sm relative overflow-hidden">
+        <div class="flex items-center justify-between">
+          <div>
+            <p class="text-xs font-semibold uppercase tracking-wider text-purple-400">Pending Value</p>
+            <h3 class="text-2xl font-bold text-purple-400 mt-1" id="stat-pending-amount">₦0</h3>
+          </div>
+          <div class="w-12 h-12 rounded-xl bg-purple-500/10 border border-purple-500/20 flex items-center justify-center text-purple-400">
+            <i class="fa-solid fa-vault text-lg"></i>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- CONTROL TOOLBAR -->
+    <div class="bg-dark-900 border border-slate-800 rounded-2xl p-4 flex flex-col md:flex-row gap-4 items-center justify-between shadow-sm">
+      
+      <!-- Search Input -->
+      <div class="relative w-full md:w-96">
+        <div class="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-500">
+          <i class="fa-solid fa-magnifying-glass text-sm"></i>
+        </div>
+        <input 
+          type="text" 
+          id="tableSearch" 
+          placeholder="Search user, account, bank, phone..." 
+          class="w-full bg-dark-950 border border-slate-800 rounded-xl pl-10 pr-4 py-2.5 text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:border-emerald-500 transition"
+        >
+      </div>
+
+      <!-- Status Filters -->
+      <div class="flex items-center space-x-1.5 w-full md:w-auto overflow-x-auto pb-2 md:pb-0">
+        <button onclick="filterStatus('all')" class="filter-btn active px-4 py-2 rounded-xl text-xs font-semibold transition bg-emerald-500 text-white shadow-sm" data-filter="all">All</button>
+        <button onclick="filterStatus('pending')" class="filter-btn px-4 py-2 rounded-xl text-xs font-semibold transition bg-slate-800/60 text-slate-400 hover:text-white" data-filter="pending">Pending</button>
+        <button onclick="filterStatus('paid')" class="filter-btn px-4 py-2 rounded-xl text-xs font-semibold transition bg-slate-800/60 text-slate-400 hover:text-white" data-filter="paid">Approved / Paid</button>
+        <button onclick="filterStatus('rejected')" class="filter-btn px-4 py-2 rounded-xl text-xs font-semibold transition bg-slate-800/60 text-slate-400 hover:text-white" data-filter="rejected">Rejected</button>
+      </div>
+    </div>
+
+    <!-- WITHDRAWALS DATA TABLE -->
+    <div class="bg-dark-900 border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
+      <div class="overflow-x-auto">
+        <table class="w-full text-left border-collapse" id="withdrawalsTable">
+          <thead>
+            <tr class="border-b border-slate-800 bg-slate-900/50 text-slate-400 text-xs font-semibold uppercase tracking-wider">
+              <th class="py-4 px-6">User / Recipient</th>
+              <th class="py-4 px-6">Payout Destination</th>
+              <th class="py-4 px-6">Amount</th>
+              <th class="py-4 px-6">Status</th>
+              <th class="py-4 px-6">Date</th>
+              <th class="py-4 px-6 text-right">Actions</th>
             </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    {% else %}
-      <p>No withdrawal requests.</p>
-    {% endif %}
+          </thead>
+          <tbody class="divide-y divide-slate-800/60 text-sm">
+            {% if withdrawals %}
+              {% for id, w in withdrawals.items() %}
+                {% set status_clean = (w.status or 'pending')|lower %}
+                <tr class="table-row hover:bg-slate-800/30 transition group" 
+                    data-status="{{ status_clean }}" 
+                    data-amount="{{ w.amount or 0 }}"
+                    data-search="{{ w.username or '' }} {{ w.user_id or w.telegram_id or '' }} {{ w.bank or '' }} {{ w.account or '' }} {{ w.account_name or '' }} {{ w.phone or '' }}">
+                  
+                  <!-- User Info -->
+                  <td class="py-4 px-6">
+                    <div class="flex items-center space-x-3">
+                      <div class="w-9 h-9 rounded-full bg-slate-800 border border-slate-700 flex items-center justify-center font-bold text-slate-300 text-xs">
+                        {{ (w.username or 'U')[0]|upper }}
+                      </div>
+                      <div>
+                        <div class="font-medium text-white flex items-center space-x-1.5">
+                          <span>{{ w.username or 'Telegram User' }}</span>
+                        </div>
+                        <div class="text-xs text-slate-500 font-mono flex items-center space-x-1">
+                          <span>ID: {{ w.user_id or w.telegram_id or 'N/A' }}</span>
+                          <button onclick="copyToClipboard('{{ w.user_id or w.telegram_id }}')" class="hover:text-emerald-400 transition" title="Copy User ID">
+                            <i class="fa-regular fa-copy text-[10px]"></i>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </td>
+
+                  <!-- Payout Destination -->
+                  <td class="py-4 px-6">
+                    {% if w.bank or w.account %}
+                      <!-- Cash Payout -->
+                      <div class="space-y-1">
+                        <div class="flex items-center space-x-1.5">
+                          <span class="px-2 py-0.5 rounded bg-blue-500/10 text-blue-400 border border-blue-500/20 text-[11px] font-semibold">
+                            <i class="fa-solid fa-building-columns mr-1"></i>{{ w.bank or 'Bank' }}
+                          </span>
+                        </div>
+                        <div class="flex items-center space-x-2">
+                          <span class="font-mono text-slate-200 font-medium">{{ w.account or 'N/A' }}</span>
+                          <button onclick="copyToClipboard('{{ w.account }}')" class="text-slate-500 hover:text-emerald-400 transition" title="Copy Account Number">
+                            <i class="fa-regular fa-copy text-xs"></i>
+                          </button>
+                        </div>
+                        <div class="text-xs text-slate-400">{{ w.account_name or '' }}</div>
+                      </div>
+                    {% else %}
+                      <!-- Airtime Payout -->
+                      <div class="space-y-1">
+                        <span class="px-2 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20 text-[11px] font-semibold">
+                          <i class="fa-solid fa-mobile-screen mr-1"></i>{{ w.network or 'Airtime' }}
+                        </span>
+                        <div class="font-mono text-slate-200">{{ w.phone or 'N/A' }}</div>
+                      </div>
+                    {% endif %}
+                  </td>
+
+                  <!-- Amount -->
+                  <td class="py-4 px-6">
+                    <span class="text-base font-bold text-emerald-400">₦{{ "{:,}".format(w.amount|int if w.amount else 0) }}</span>
+                  </td>
+
+                  <!-- Status -->
+                  <td class="py-4 px-6">
+                    {% if 'paid' in status_clean or 'approved' in status_clean or 'completed' in status_clean %}
+                      <span class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                        <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1.5"></span>
+                        Paid & Sent
+                      </span>
+                    {% elif 'reject' in status_clean or 'failed' in status_clean %}
+                      <span class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium bg-red-500/10 text-red-400 border border-red-500/20">
+                        <span class="w-1.5 h-1.5 rounded-full bg-red-400 mr-1.5"></span>
+                        Rejected
+                      </span>
+                    {% else %}
+                      <span class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/20 animate-pulse">
+                        <span class="w-1.5 h-1.5 rounded-full bg-amber-400 mr-1.5"></span>
+                        Pending Review
+                      </span>
+                    {% endif %}
+                  </td>
+
+                  <!-- Date -->
+                  <td class="py-4 px-6 text-xs text-slate-400 font-mono">
+                    {{ (w.date or 'Just now')[:10] }}
+                  </td>
+
+                  <!-- Actions -->
+                  <td class="py-4 px-6 text-right">
+                    {% if 'paid' not in status_clean and 'approved' not in status_clean and 'reject' not in status_clean and 'failed' not in status_clean %}
+                      <div class="flex items-center justify-end space-x-2">
+                        <!-- Mark Paid Form -->
+                        <form action="/mark_paid/{{ id }}" method="POST" onsubmit="return confirm('Approve this transfer of ₦{{ w.amount }} to {{ w.account_name or w.username }}?')">
+                          <button type="submit" class="bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-xs px-3.5 py-2 rounded-xl transition flex items-center space-x-1.5 shadow-sm">
+                            <i class="fa-solid fa-check"></i>
+                            <span>Pay</span>
+                          </button>
+                        </form>
+                        <!-- Reject Form -->
+                        <form action="/reject/{{ id }}" method="POST" onsubmit="return confirm('Reject request and REFUND ₦{{ w.amount }} to user?')">
+                          <button type="submit" class="bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20 font-medium text-xs px-3.5 py-2 rounded-xl transition flex items-center space-x-1.5">
+                            <i class="fa-solid fa-xmark"></i>
+                            <span>Reject</span>
+                          </button>
+                        </form>
+                      </div>
+                    {% else %}
+                      <span class="text-xs text-slate-500 font-medium italic">Settled</span>
+                    {% endif %}
+                  </td>
+                </tr>
+              {% endfor %}
+            {% else %}
+              <tr id="noDataRow">
+                <td colspan="6" class="py-12 text-center text-slate-500">
+                  <i class="fa-solid fa-inbox text-4xl mb-3 block text-slate-600"></i>
+                  <p class="text-base font-medium">No withdrawal requests recorded yet.</p>
+                </td>
+              </tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </main>
+
+  <!-- TOAST NOTIFICATION -->
+  <div id="toast" class="fixed bottom-6 right-6 bg-slate-900 border border-emerald-500/30 text-white px-4 py-3 rounded-xl shadow-2xl flex items-center space-x-3 transition-all duration-300 transform translate-y-24 opacity-0 z-50">
+    <div class="w-6 h-6 rounded-full bg-emerald-500/20 text-emerald-400 flex items-center justify-center text-xs">
+      <i class="fa-solid fa-check"></i>
+    </div>
+    <span id="toastMsg" class="text-sm font-medium">Copied to clipboard!</span>
   </div>
+
+  <!-- JAVASCRIPT FOR REALTIME STATS & SEARCH -->
+  <script>
+    // Copy Helper
+    function copyToClipboard(text) {
+      if (!text || text === 'N/A') return;
+      navigator.clipboard.writeText(text);
+      const toast = document.getElementById('toast');
+      const toastMsg = document.getElementById('toastMsg');
+      toastMsg.innerText = `Copied: ${text}`;
+      toast.classList.remove('translate-y-24', 'opacity-0');
+      setTimeout(() => {
+        toast.classList.add('translate-y-24', 'opacity-0');
+      }, 2500);
+    }
+
+    // Dynamic Metric Computation
+    function calculateKPIs() {
+      const rows = document.querySelectorAll('.table-row');
+      let total = rows.length;
+      let pendingCount = 0;
+      let paidSum = 0;
+      let pendingSum = 0;
+
+      rows.forEach(r => {
+        const st = r.getAttribute('data-status') || '';
+        const amt = parseFloat(r.getAttribute('data-amount')) || 0;
+
+        if (st.includes('paid') || st.includes('approved') || st.includes('completed')) {
+          paidSum += amt;
+        } else if (!st.includes('reject') && !st.includes('failed')) {
+          pendingCount++;
+          pendingSum += amt;
+        }
+      });
+
+      document.getElementById('stat-total').innerText = total;
+      document.getElementById('stat-pending').innerText = pendingCount;
+      document.getElementById('stat-paid-amount').innerText = '₦' + paidSum.toLocaleString();
+      document.getElementById('stat-pending-amount').innerText = '₦' + pendingSum.toLocaleString();
+    }
+
+    // Search filter
+    document.getElementById('tableSearch').addEventListener('input', function(e) {
+      const q = e.target.value.toLowerCase().trim();
+      const rows = document.querySelectorAll('.table-row');
+      rows.forEach(r => {
+        const content = r.getAttribute('data-search').toLowerCase();
+        if (content.includes(q)) {
+          r.style.display = '';
+        } else {
+          r.style.display = 'none';
+        }
+      });
+    });
+
+    // Status Tab filter
+    function filterStatus(status) {
+      const btns = document.querySelectorAll('.filter-btn');
+      btns.forEach(b => {
+        if (b.getAttribute('data-filter') === status) {
+          b.className = 'filter-btn active px-4 py-2 rounded-xl text-xs font-semibold transition bg-emerald-500 text-white shadow-sm';
+        } else {
+          b.className = 'filter-btn px-4 py-2 rounded-xl text-xs font-semibold transition bg-slate-800/60 text-slate-400 hover:text-white';
+        }
+      });
+
+      const rows = document.querySelectorAll('.table-row');
+      rows.forEach(r => {
+        const st = r.getAttribute('data-status') || '';
+        if (status === 'all') {
+          r.style.display = '';
+        } else if (status === 'pending') {
+          r.style.display = (!st.includes('paid') && !st.includes('approved') && !st.includes('reject') && !st.includes('failed')) ? '' : 'none';
+        } else if (status === 'paid') {
+          r.style.display = (st.includes('paid') || st.includes('approved') || st.includes('completed')) ? '' : 'none';
+        } else if (status === 'rejected') {
+          r.style.display = (st.includes('reject') || st.includes('failed')) ? '' : 'none';
+        }
+      });
+    }
+
+    // Run on load
+    document.addEventListener('DOMContentLoaded', calculateKPIs);
+  </script>
 </body>
 </html>
